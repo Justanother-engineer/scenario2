@@ -1,7 +1,7 @@
 param()
 
 # -- CONFIG: set this to your GitHub raw base URL --
-$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario-02-clickfix/main/src"
+$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario2/main"
 
 # ── Elevation Gate ──────────────────────────────────────────────
 $isAdmin = [Security.Principal.WindowsPrincipal]::new(
@@ -23,7 +23,7 @@ Write-Host "[*] Running with admin privileges. Proceeding..."
 $ErrorActionPreference = "SilentlyContinue"
 $VerbosePreference = "Continue"
 
-Write-Host "[*] Cleaning up scenario-02-clickfix artifacts..."
+Write-Host "[*] Cleaning up scenario-02 artifacts..."
 
 # 1. Delete scattered artifact files
 $files = @(
