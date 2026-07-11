@@ -1,0 +1,53 @@
+<?XML version="1.0"?>
+<scriptlet>
+<registration
+    progid="StageSquibly"
+    classid="{B4444444-5555-6666-7777-888888888888}"
+    remotable="yes"
+>
+</registration>
+<script language="JScript">
+<![CDATA[
+function randomString(length) {
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    var result = "";
+    for (var i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+
+function sctLog(msg) {
+    try {
+        var fso = new ActiveXObject("Scripting.FileSystemObject");
+        var f = fso.OpenTextFile("C:\\ProgramData\\USOShared\\Logs\\cache.dat", 8, true);
+        var now = new Date();
+        var ts = "[" + now.getFullYear() + "-" + ("0"+(now.getMonth()+1)).slice(-2) + "-" + ("0"+now.getDate()).slice(-2) + " " +
+                 ("0"+now.getHours()).slice(-2) + ":" + ("0"+now.getMinutes()).slice(-2) + ":" + ("0"+now.getSeconds()).slice(-2) + "] ";
+        f.WriteLine(ts + msg);
+        f.Close();
+    } catch (e) {}
+}
+
+sctLog("[*] stage.sct started (regsvr32 context)");
+
+for (var i = 0; i < 5; i++) {
+    var subdomain = randomString(12);
+    var host = subdomain + ".github.com";
+    sctLog("[*] HTTP GET " + (i+1) + "/5: http://" + host);
+    var status = "ERR";
+    try {
+        var xhr = new ActiveXObject("MSXML2.XMLHTTP");
+        xhr.open("GET", "http://" + host, false);
+        xhr.setRequestHeader("User-Agent", "Mozilla/5.0");
+        xhr.send();
+        status = String(xhr.status);
+    } catch (e) { status = "NXDOMAIN"; }
+    sctLog("[+] " + host + " -> " + status);
+    try { WScript.Sleep(5000); } catch (e) {}
+}
+
+sctLog("[+] stage.sct complete");
+]]>
+</script>
+</scriptlet>

