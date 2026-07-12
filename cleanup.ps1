@@ -43,7 +43,7 @@ $files = @(
     "C:\Users\Public\Libraries\msimtf.dll",
     "C:\Users\Public\Libraries\tcmsetup.exe",
     "C:\Users\Public\Libraries\colorcpl.exe",
-    "C:\ProgramData\Microsoft\Search\Data\EDS\stage.sct",
+    "C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys\stage.sct",
     "C:\ProgramData\Microsoft\Windows\WER\ReportQueue\stage.js",
     "C:\ProgramData\Microsoft\Windows\WER\Temp\report.hta",
     "C:\Users\Public\Libraries\Telemetry.dll",

